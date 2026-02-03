@@ -9,6 +9,14 @@ let stats = {
   files: []
 };
 
+// Service Worker起動時にisEnabledの状態を復元
+chrome.storage.local.get('isEnabled', (result) => {
+  if (result.isEnabled !== undefined) {
+    isEnabled = result.isEnabled;
+  }
+  console.log('[HLS Saver] Initialized, capturing:', isEnabled);
+});
+
 // IndexedDB初期化
 async function openDB() {
   return new Promise((resolve, reject) => {
@@ -111,6 +119,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   if (message.action === 'toggle') {
     isEnabled = !isEnabled;
+    chrome.storage.local.set({ isEnabled });
     sendResponse({ enabled: isEnabled });
     return false;
   }
