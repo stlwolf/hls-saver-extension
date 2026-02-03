@@ -9,13 +9,17 @@ let stats = {
   files: []
 };
 
-// Service Worker起動時にisEnabledの状態を復元
-chrome.storage.local.get('isEnabled', (result) => {
-  if (result.isEnabled !== undefined) {
-    isEnabled = result.isEnabled;
+// Restore isEnabled state on Service Worker startup
+const isEnabledInitPromise = (async () => {
+  try {
+    const result = await chrome.storage.local.get('isEnabled');
+    if (result.isEnabled !== undefined) {
+      isEnabled = result.isEnabled;
+    }
+  } finally {
+    console.log('[HLS Saver] Initialized, capturing:', isEnabled);
   }
-  console.log('[HLS Saver] Initialized, capturing:', isEnabled);
-});
+})();
 
 // IndexedDB初期化
 async function openDB() {
@@ -87,31 +91,39 @@ async function clearDB() {
 
 // メッセージハンドラ
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'saveSegment' && isEnabled) {
-    saveSegment(message)
-      .then(() => {
-        stats.captured++;
-        stats.totalSize += message.size;
-        stats.files.push({
-          filename: message.filename,
-          size: message.size
+  if (message.action === 'saveSegment') {
+    isEnabledInitPromise.then(() => {
+      if (!isEnabled) {
+        sendResponse({ success: false, skipped: true });
+        return;
+      }
+      saveSegment(message)
+        .then(() => {
+          stats.captured++;
+          stats.totalSize += message.size;
+          stats.files.push({
+            filename: message.filename,
+            size: message.size
+          });
+          sendResponse({ success: true });
+        })
+        .catch(err => {
+          console.error('Save failed:', err);
+          sendResponse({ success: false, error: err.message });
         });
-        sendResponse({ success: true });
-      })
-      .catch(err => {
-        console.error('Save failed:', err);
-        sendResponse({ success: false, error: err.message });
-      });
+    });
     return true; // async response
   }
-  
+
   if (message.action === 'getStats') {
-    getAllSegments().then(segments => {
-      sendResponse({
-        enabled: isEnabled,
-        captured: segments.length,
-        totalSize: segments.reduce((sum, s) => sum + s.size, 0),
-        files: segments.map(s => ({ filename: s.filename, size: s.size }))
+    isEnabledInitPromise.then(() => {
+      getAllSegments().then(segments => {
+        sendResponse({
+          enabled: isEnabled,
+          captured: segments.length,
+          totalSize: segments.reduce((sum, s) => sum + s.size, 0),
+          files: segments.map(s => ({ filename: s.filename, size: s.size }))
+        });
       });
     });
     return true;
