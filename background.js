@@ -38,13 +38,32 @@ async function openDB() {
   });
 }
 
-// セグメント保存
+// セグメントの存在チェック
+async function checkExists(filename) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.get(filename);
+
+    request.onsuccess = () => resolve(request.result !== undefined);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// セグメント保存（重複チェック付き）
 async function saveSegment(data) {
+  // 重複チェック
+  const exists = await checkExists(data.filename);
+  if (exists) {
+    return { saved: false, skipped: true };
+  }
+
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    
+
     const record = {
       filename: data.filename,
       url: data.url,
@@ -53,9 +72,9 @@ async function saveSegment(data) {
       timestamp: data.timestamp,
       pageUrl: data.pageUrl
     };
-    
+
     const request = store.put(record);
-    request.onsuccess = () => resolve(true);
+    request.onsuccess = () => resolve({ saved: true, skipped: false });
     request.onerror = () => reject(request.error);
   });
 }
@@ -98,14 +117,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       saveSegment(message)
-        .then(() => {
-          stats.captured++;
-          stats.totalSize += message.size;
-          stats.files.push({
-            filename: message.filename,
-            size: message.size
-          });
-          sendResponse({ success: true });
+        .then((result) => {
+          if (result.skipped) {
+            console.log('[HLS Saver] Skipped duplicate:', message.filename);
+            sendResponse({ success: true, skipped: true });
+          } else {
+            stats.captured++;
+            stats.totalSize += message.size;
+            stats.files.push({
+              filename: message.filename,
+              size: message.size
+            });
+            sendResponse({ success: true, skipped: false });
+          }
         })
         .catch(err => {
           console.error('Save failed:', err);
