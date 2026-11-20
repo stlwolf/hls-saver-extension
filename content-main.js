@@ -3,7 +3,6 @@
   'use strict';
   const TARGET = /\.(ts|m3u8|m4s|mp4)(?:[?#]|$)/i;
   const CHUNK = 192 * 1024;
-  const MAX_PENDING = 8 * 1024 * 1024;
   const MAX_RECORD = 32 * 1024 * 1024;
   let state = { initialized: false, enabled: false, generation: 0, sessionId: null };
   function createInitialization() {
@@ -32,7 +31,7 @@
     if (!start.initialization) return isCurrent(start);
     return start.initialization === initialization && (!initialization.settled || isCurrent(initialization.value));
   }
-  let active = 0, pendingBytes = 0;
+  let active = 0;
   const replies = new Map();
   function rpc(message) {
     return new Promise((resolve, reject) => {
@@ -84,51 +83,49 @@
       return;
     }
     active++;
-    let recordId, captureState, chunks = 0, total = 0, failed = null, skipped = false;
-    const deadline = setTimeout(() => {
-      failed = new Error('断片の収録がタイムアウトしました。');
-      void reader.cancel().catch(() => {});
-    }, 30000);
-    // Drain the clone promptly. Waiting on each DB ACK here would let the tee buffer grow.
-    // Jobs are capped globally; on overload we cancel our branch instead of slowing playback.
-    let writes = decisionFor(start).then(async decision => {
-      if (!isCurrent(decision)) { skipped = true; void reader.cancel().catch(() => {}); return; }
+    let recordId, captureState, chunks = 0, total = 0;
+    try {
+      const decision = await decisionFor(start);
+      if (!isCurrent(decision)) return;
       captureState = decision;
       const result = await rpc({ action: 'begin', sessionId: decision.sessionId, generation: decision.generation,
         url: meta.url, responseUrl: meta.responseUrl, range: meta.range, mime: meta.mime });
+      if (result.skipped) return;
       recordId = result.recordId;
-      if (result.skipped) { skipped = true; void reader.cancel().catch(() => {}); }
-    }).catch(error => { failed = error; void reader.cancel().catch(() => {}); });
-    try {
-      while (!failed && !skipped) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      while (true) {
+        // Bound inactivity, not the duration of a recording that is still making progress.
+        let timer;
+        let next;
+        try {
+          next = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('断片の受信が30秒間進みませんでした。')), 30000); })
+          ]);
+        } finally { clearTimeout(timer); }
+        if (next.done) break;
+        const value = next.value;
         total += value.byteLength;
         if (total > MAX_RECORD) throw new Error('1断片の上限（32 MiB）を超えました。');
         for (let offset = 0; offset < value.length; offset += CHUNK) {
-          const bytes = value.slice(offset, offset + CHUNK);
-          if (pendingBytes + bytes.length > MAX_PENDING) throw new Error('保存が追いつきません。蓄積に欠落があります。');
-          pendingBytes += bytes.length;
-          const index = chunks++;
-          writes = writes.then(async () => {
-            if (!failed && recordId) await rpc({ action: 'chunk', sessionId: captureState.sessionId, recordId, index, data: encode(bytes) });
-          }).catch(error => { failed = error; void reader.cancel().catch(() => {}); })
-            .finally(() => { pendingBytes -= bytes.length; });
+          // One unacknowledged chunk per capture; a burst cannot enqueue a whole body.
+          // Playback consumes its original response independently. The clone's browser
+          // buffers and the current read value are separate from this transfer bound.
+          const bytes = value.subarray(offset, offset + CHUNK);
+          await rpc({ action: 'chunk', sessionId: captureState.sessionId, recordId, index: chunks, data: encode(bytes) });
+          chunks++;
         }
       }
+      await rpc({ action: 'finish', sessionId: captureState.sessionId, recordId, chunks });
     } catch (error) {
-      failed = error;
-      void reader.cancel().catch(() => {});
-    }
-    await writes;
-    clearTimeout(deadline);
-    try {
       if (recordId) {
-        if (failed) await rpc({ action: 'fail', sessionId: captureState.sessionId, recordId, error: failed.message });
-        else await rpc({ action: 'finish', sessionId: captureState.sessionId, recordId, chunks });
-      } else if (failed) report(failed, start);
-    } catch (error) { report(error, start); }
-    finally { active--; }
+        try { await rpc({ action: 'fail', sessionId: captureState.sessionId, recordId, error: error.message }); }
+        catch { report(error, start); }
+      } else report(error, start);
+    } finally {
+      // Never await tee cancellation: the playback branch may still be consuming.
+      void reader.cancel().catch(() => {});
+      active--;
+    }
   }
   const originalFetch = window.fetch;
   window.fetch = async function(...args) {

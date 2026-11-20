@@ -210,3 +210,19 @@ test('unsupported audio playlist cannot prevent exporting a supported video play
   assert.throws(() => h.planPlaylist(audio, [rec('a.ts')]), /EXT-X-SKIP/);
   assert.equal(h.planPlaylist(video, [rec('v.ts')]).count, 1);
 });
+test('stats distinguish playlists from completed media and preserve failed capture state', async () => {
+  const b = background(); const s = await b.send({ action: 'register' }, b.page());
+  for (const [id, url, state] of [['p1', 'master.m3u8', 'complete'], ['p2', 'media.m3u8', 'complete'], ['bad', 'bad.ts', 'failed']]) {
+    await b.c.CaptureDB.put('records', { id, sessionId: s.id, url: 'https://video.test/' + url, state, size: 100 });
+  }
+  let stats = await b.send({ action: 'getStats', tabId: 1 }, b.control);
+  assert.equal(stats.captured, 2); assert.equal(stats.mediaCaptured, 0); assert.equal(stats.playlistsCaptured, 2); assert.equal(stats.failed, 1);
+  await b.c.CaptureDB.put('records', { id: 'media', sessionId: s.id, url: 'https://video.test/segment.ts', state: 'complete', size: 188 });
+  stats = await b.send({ action: 'getStats', tabId: 1 }, b.control);
+  assert.equal(stats.mediaCaptured, 1); assert.equal(stats.playlistsCaptured, 2);
+  await b.send({ action: 'captureError', sessionId: s.id, error: 'test failure' }, b.page());
+  assert.equal((await b.send({ action: 'setEnabled', sessionId: s.id, enabled: true }, b.control)).ok, false);
+  await b.send({ action: 'clear', sessionId: s.id }, b.control);
+  const fresh = (await b.send({ action: 'getStats', tabId: 1 }, b.control)).session;
+  assert.equal((await b.send({ action: 'setEnabled', sessionId: fresh.id, enabled: true }, b.control)).ok, true);
+});

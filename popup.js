@@ -13,21 +13,24 @@ async function refresh() {
   try {
     const stats = await send({ action: 'getStats', tabId });
     session = stats.session;
-    $('toggleBtn').disabled = !session;
+    $('toggleBtn').disabled = !session || !!session.error;
     $('downloadBtn').disabled = !session || !stats.captured || !!session.error;
     $('clearBtn').disabled = !session;
     if (!session) {
       $('error').textContent = actionError;
       $('status').textContent = '対象ページをリロードしてから再生してください。';
       $('captured').textContent = '0 件'; $('totalSize').textContent = '0 MiB'; $('pending').textContent = '0 件';
+      $('playlists').textContent = '0 件'; $('failed').textContent = '0 件';
       return;
     }
-    $('status').textContent = session.enabled ? '収録中' : stats.pending ? '停止処理中 — 受付済みデータを保存しています' : '収録 OFF';
+    $('status').textContent = session.error ? 'エラーで収録停止 — 自動再開しません' : session.enabled ? '収録中' : stats.pending ? '停止処理中 — 受付済みデータを保存しています' : '収録 OFF';
     $('toggleBtn').textContent = session.enabled ? '収録を OFF にする' : '収録を ON にする';
-    $('captured').textContent = `${stats.captured} 件`;
+    $('captured').textContent = `${stats.mediaCaptured} 件`;
+    $('playlists').textContent = `${stats.playlistsCaptured} 件`;
+    $('failed').textContent = `${stats.failed} 件`;
     $('totalSize').textContent = `${(stats.totalSize / 1024 / 1024).toFixed(1)} MiB`;
     $('pending').textContent = `${stats.pending} 件`;
-    $('error').textContent = session.error ? `${session.error}\n欠落があるため書き出しを停止しています。クリアして収録し直してください。` : actionError;
+    $('error').textContent = session.error ? `${session.error}\nこの収録には欠落があります。保存待ちの件数が減っても収録の再開ではありません。\nクリアしてONにした後、ページをリロードして再生し直してください。` : actionError;
   } catch (error) { $('error').textContent = error.message; }
   finally { refreshing = false; }
 }
