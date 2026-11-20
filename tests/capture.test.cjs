@@ -1,0 +1,82 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const fs = require('node:fs');
+const { webcrypto } = require('node:crypto');
+function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), pauseBegin = false } = {}) {
+  const listeners = new Map();
+  const messages = [];
+  let release;
+  class XHR extends EventTarget {
+    open() {} send() {}
+    getResponseHeader() { return null; }
+  }
+  const w = { addEventListener(type, fn) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); } };
+  function emit(data) { for (const listener of listeners.get('message') || []) listener({ source: w, data }); }
+  w.postMessage = data => {
+    messages.push(data);
+    if (data.type !== 'HLS_SAVER_REQUEST') return;
+    const reply = () => emit({ type: 'HLS_SAVER_REPLY', id: data.id, result: { ok: true, ...(data.action === 'begin' ? { recordId: 'record' } : {}) } });
+    if (pauseBegin && data.action === 'begin') release = reply;
+    else queueMicrotask(reply);
+  };
+  w.fetch = async () => response();
+  const c = vm.createContext({ window: w, XMLHttpRequest: XHR, crypto: webcrypto, URL, location: { href: 'https://video.test/' },
+    ArrayBuffer, Uint8Array, Blob, btoa, setTimeout, clearTimeout, console });
+  vm.runInContext(fs.readFileSync(`${__dirname}/../content-main.js`, 'utf8'), c);
+  const set = (enabled, generation) => emit({ type: 'HLS_SAVER_STATE', state: { sessionId: 'session', enabled, generation } });
+  const waitFor = async action => {
+    const end = Date.now() + 2000;
+    while (Date.now() < end) { if (messages.some(m => m.action === action)) return; await new Promise(r => setTimeout(r, 5)); }
+    throw new Error(`Missing action ${action}: ${JSON.stringify(messages.map(m => m.action))}`);
+  };
+  return { w, XHR, set, messages, waitFor, release: () => release?.() };
+}
+test('fetch response is returned and readable before storage begin ACK; capture uses small encoded chunks', async () => {
+  const s = setup({ pauseBegin: true }); s.set(true, 1);
+  const response = await s.w.fetch('https://video.test/a.ts');
+  assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [71, 1, 2]);
+  assert.ok(s.messages.some(m => m.action === 'begin'));
+  assert.ok(!s.messages.some(m => m.action === 'finish'));
+  s.release(); await s.waitFor('finish');
+  const chunk = s.messages.find(m => m.action === 'chunk');
+  assert.equal(chunk.data, 'RwEC'); assert.equal(chunk.index, 0);
+});
+test('OFF bypasses copying; an old fetch resolving after OFF/ON does not enter the new generation', async () => {
+  let resolve;
+  const s = setup({ response: () => new Promise(r => { resolve = r; }) });
+  s.set(true, 1);
+  const pending = s.w.fetch('https://video.test/a.ts');
+  s.set(false, 2); s.set(true, 3);
+  resolve(new Response(new Uint8Array([71]))); await pending;
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(s.messages.filter(m => m.action === 'begin').length, 0);
+  s.set(false, 4);
+  const off = s.w.fetch('https://video.test/b.ts'); resolve(new Response('x')); await off;
+  assert.equal(s.messages.filter(m => m.action === 'begin').length, 0);
+});
+test('XHR text playlist and binary Blob are both captured without modifying playback response', async () => {
+  const s = setup(); s.set(true, 1);
+  const xhr = new s.XHR(); xhr.open('GET', '/index.m3u8'); xhr.responseType = ''; xhr.responseText = '#EXTM3U\na.ts'; xhr.status = 200;
+  xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('finish');
+  assert.equal(xhr.responseText, '#EXTM3U\na.ts');
+  assert.equal(s.messages.find(m => m.action === 'begin').url, 'https://video.test/index.m3u8');
+});
+test('slow storage triggers bounded queue overload rather than blocking the original response', async () => {
+  const bytes = new Uint8Array(9 * 1024 * 1024); bytes[0] = 71;
+  const s = setup({ response: () => new Response(bytes), pauseBegin: true }); s.set(true, 1);
+  const response = await s.w.fetch('https://video.test/a.ts');
+  assert.equal((await response.arrayBuffer()).byteLength, bytes.length);
+  s.release(); await s.waitFor('fail');
+  assert.match(s.messages.find(m => m.action === 'fail').error, /追いつきません/);
+});
+test('reusing an aborted XHR does not leave an old capture listener; Blob response is preserved', async () => {
+  const s = setup(); s.set(true, 1);
+  const xhr = new s.XHR(); xhr.open('GET', '/aborted.ts'); xhr.send();
+  xhr.open('GET', '/actual.ts'); xhr.responseType = 'blob'; xhr.response = new Blob([new Uint8Array([71, 4, 5])]); xhr.status = 200;
+  const original = xhr.response;
+  xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('finish');
+  assert.equal(xhr.response, original);
+  assert.equal(s.messages.filter(m => m.action === 'begin').length, 1);
+  assert.equal(s.messages.find(m => m.action === 'begin').url, 'https://video.test/actual.ts');
+});

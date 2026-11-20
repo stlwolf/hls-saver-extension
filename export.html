@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>HLS Saver — 書き出し</title><link rel="stylesheet" href="ui.css"></head>
+<body class="export"><main>
+<h1>収録データの書き出し</h1>
+<p>書き出しを押した時点のデータが対象です。元のページを閉じる・リロードする・クリアすると、この書き出しも中止されます。</p>
+<p id="status" role="status" aria-live="polite">保存待ちの断片を確認しています…</p>
+<label for="playlist">動画・音声のプレイリスト</label>
+<select id="playlist" disabled></select>
+<p id="details"></p>
+<p id="warning" class="warning"></p>
+<progress id="progress" value="0" max="1"></progress>
+<div class="actions"><button id="save" disabled>保存先を選んで書き出す</button><button id="cancel" disabled>中止</button></div>
+<p id="error" class="error" role="alert"></p>
+<p class="muted">TS または fMP4 として保存します。別音声は別ファイルです。MP4 への変換や映像・音声の多重化は必要に応じてローカルの ffmpeg で行ってください。</p>
+</main><script src="storage.js"></script><script src="playlist.js"></script><script src="export.js"></script></body>
+</html>

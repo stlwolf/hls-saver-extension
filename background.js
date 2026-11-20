@@ -1,218 +1,189 @@
-// background.js - Service Worker
-const DB_NAME = 'HLSSaverDB';
-const STORE_NAME = 'segments';
-
-let isEnabled = true;
-let stats = {
-  captured: 0,
-  totalSize: 0,
-  files: []
+/* All lifecycle mutations use one lane: late chunks cannot resurrect deleted sessions. */
+importScripts('storage.js');
+const MAX_RECORD = 32 * 1024 * 1024;
+const MAX_CHUNK = 192 * 1024;
+let lane = Promise.resolve();
+const serialize = work => {
+  const result = lane.then(work);
+  lane = result.catch(error => console.warn('[HLS Saver]', error.message));
+  return result;
 };
-
-// Restore isEnabled state on Service Worker startup
-const isEnabledInitPromise = (async () => {
-  try {
-    const result = await chrome.storage.local.get('isEnabled');
-    if (result.isEnabled !== undefined) {
-      isEnabled = result.isEnabled;
-    }
-  } finally {
-    console.log('[HLS Saver] Initialized, capturing:', isEnabled);
+let epoch;
+const ready = (async () => {
+  const state = await chrome.storage.session.get('captureEpoch');
+  epoch = state.captureEpoch || crypto.randomUUID();
+  if (!state.captureEpoch) await chrome.storage.session.set({ captureEpoch: epoch });
+  for (const session of await CaptureDB.all('sessions')) {
+    const frame = await chrome.webNavigation.getFrame({ tabId: session.tabId, frameId: 0 }).catch(() => null);
+    if (session.epoch !== epoch || frame?.documentId !== session.documentId) await CaptureDB.removeSession(session.id);
   }
+  await chrome.alarms.create('capture-maintenance', { periodInMinutes: 1 });
 })();
-
-// IndexedDB初期化
-async function openDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
-    
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-    
-    request.onupgradeneeded = (event) => {
-      const db = event.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'filename' });
+async function sendState(session) {
+  const result = await chrome.tabs.sendMessage(session.tabId, {
+    type: 'captureState', sessionId: session.id, generation: session.generation, enabled: session.enabled
+  }, { documentId: session.documentId });
+  if (result?.ok === false) throw new Error('ページ側で収録状態を更新できませんでした。リロードしてください。');
+}
+async function requireSession(id) {
+  const session = await CaptureDB.get('sessions', id);
+  if (!session || session.epoch !== epoch) throw new Error('ページが閉じられたか、収録データが削除されました。');
+  return session;
+}
+async function failSession(session, error) {
+  session.enabled = false;
+  session.generation++;
+  session.error = String(error).slice(0, 400);
+  await CaptureDB.put('sessions', session);
+  await sendState(session);
+}
+async function maintain() {
+  for (const session of await CaptureDB.all('sessions')) {
+    for (const record of await CaptureDB.all('records', session.id)) {
+      if (record.state === 'pending' && Date.now() - record.touched > 30000) {
+        await CaptureDB.put('records', { ...record, state: 'failed', error: '保存処理がタイムアウトしました。' });
+        await failSession(session, '保存処理が中断しました。蓄積に欠落があります。');
       }
-    };
-  });
-}
-
-// セグメントの存在チェック
-async function checkExists(filename) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.get(filename);
-
-    request.onsuccess = () => resolve(request.result !== undefined);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-// セグメント保存（重複チェック付き）
-async function saveSegment(data) {
-  // 重複チェック
-  const exists = await checkExists(data.filename);
-  if (exists) {
-    return { saved: false, skipped: true };
+    }
   }
-
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-
-    const record = {
-      filename: data.filename,
-      url: data.url,
-      data: new Uint8Array(data.data),
-      size: data.size,
-      timestamp: data.timestamp,
-      pageUrl: data.pageUrl
-    };
-
-    const request = store.put(record);
-    request.onsuccess = () => resolve({ saved: true, skipped: false });
-    request.onerror = () => reject(request.error);
-  });
 }
-
-// 全セグメント取得
-async function getAllSegments() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.getAll();
-    
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-// DB クリア
-async function clearDB() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.clear();
-    
-    request.onsuccess = () => {
-      stats = { captured: 0, totalSize: 0, files: [] };
-      resolve(true);
-    };
-    request.onerror = () => reject(request.error);
-  });
-}
-
-// メッセージハンドラ
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'saveSegment') {
-    isEnabledInitPromise.then(() => {
-      if (!isEnabled) {
-        sendResponse({ success: false, skipped: true });
-        return;
-      }
-      saveSegment(message)
-        .then((result) => {
-          if (result.skipped) {
-            console.log('[HLS Saver] Skipped duplicate:', message.filename);
-            sendResponse({ success: true, skipped: true });
-          } else {
-            stats.captured++;
-            stats.totalSize += message.size;
-            stats.files.push({
-              filename: message.filename,
-              size: message.size
-            });
-            sendResponse({ success: true, skipped: false });
+async function handle(message, sender) {
+  await ready;
+  if (message.action === 'register') {
+    if (!sender.tab || sender.frameId !== 0 || !sender.documentId) throw new Error('トップページでのみ収録できます。');
+    const frame = await chrome.webNavigation.getFrame({ tabId: sender.tab.id, frameId: 0 });
+    if (frame?.documentId !== sender.documentId || frame.documentLifecycle === 'cached') throw new Error('古いページからの登録を拒否しました。');
+    let session;
+    for (const old of await CaptureDB.all('sessions')) {
+      if (old.tabId !== sender.tab.id) continue;
+      if (old.documentId === sender.documentId) session = old;
+      else await CaptureDB.removeSession(old.id);
+    }
+    if (!session) {
+      const pref = await chrome.storage.local.get('isEnabled');
+      session = { id: crypto.randomUUID(), tabId: sender.tab.id, documentId: sender.documentId,
+        epoch, generation: 1, enabled: pref.isEnabled !== false, sequence: 0, error: '', pageUrl: sender.url };
+      await CaptureDB.put('sessions', session);
+    }
+    return session;
+  }
+  if (sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) {
+    const session = await requireSession(message.sessionId);
+    if (session.tabId !== sender.tab.id || session.documentId !== sender.documentId) throw new Error('収録ページが一致しません。');
+    if (message.action === 'begin') {
+      if (!session.enabled || message.generation !== session.generation) return { skipped: true };
+      if (!/^https?:\/\//.test(message.url) || !/\.(m3u8|ts|m4s|mp4)(?:[?#]|$)/i.test(message.url)) throw new Error('対象外のURLです。');
+      if ((await CaptureDB.all('records', session.id)).filter(r => r.state === 'pending').length >= 32) throw new Error('同時保存数の上限を超えました。');
+      session.sequence++;
+      const record = { id: crypto.randomUUID(), sessionId: session.id, sequence: session.sequence,
+        url: message.url, range: message.range || '', mime: message.mime || '', state: 'pending',
+        chunks: 0, size: 0, touched: Date.now() };
+      await CaptureDB.put('sessions', session);
+      await CaptureDB.put('records', record);
+      return { recordId: record.id };
+    }
+    if (message.action === 'captureError') {
+      await failSession(session, message.error || 'キャプチャに失敗しました。');
+      return {};
+    }
+    const record = await CaptureDB.get('records', message.recordId);
+    if (!record || record.sessionId !== session.id || record.state !== 'pending') throw new Error('保存対象が無効です。');
+    try {
+      if (message.action === 'chunk') {
+        if (typeof message.data !== 'string' || message.data.length > MAX_CHUNK * 4 / 3 + 4) throw new Error('転送チャンクが大きすぎます。');
+        const bytes = Uint8Array.from(atob(message.data), c => c.charCodeAt(0));
+        if (message.index !== record.chunks || !bytes.length || record.size + bytes.length > MAX_RECORD) throw new Error('断片のサイズまたは順序が不正です。');
+        await CaptureDB.append(record, bytes);
+      } else if (message.action === 'finish') {
+        if (record.chunks !== message.chunks || !record.size) throw new Error('保存が不完全です。');
+        record.state = 'complete';
+        await CaptureDB.put('records', record);
+        if (!/\.m3u8(?:[?#]|$)/i.test(record.url)) {
+          const pinned = new Set((await CaptureDB.all('exports', session.id)).flatMap(job => job.recordIds));
+          for (const old of await CaptureDB.all('records', session.id)) {
+            if (old.id !== record.id && old.state === 'complete' && old.url === record.url && old.range === record.range && !pinned.has(old.id)) await CaptureDB.removeRecord(old.id);
           }
-        })
-        .catch(err => {
-          console.error('Save failed:', err);
-          sendResponse({ success: false, error: err.message });
-        });
-    });
-    return true; // async response
+        }
+      } else if (message.action === 'fail') {
+        record.state = 'failed'; record.error = String(message.error || '保存が中断しました。').slice(0, 400);
+        await CaptureDB.put('records', record);
+        await failSession(session, record.error);
+      } else throw new Error('不明な収録操作です。');
+    } catch (error) {
+      await CaptureDB.put('records', { ...record, state: 'failed', error: error.message }).catch(() => {});
+      await failSession(session, error.message).catch(() => {});
+      throw error;
+    }
+    return {};
   }
-
+  if (!sender.url?.startsWith(chrome.runtime.getURL(''))) throw new Error('拡張画面から操作してください。');
   if (message.action === 'getStats') {
-    isEnabledInitPromise.then(() => {
-      getAllSegments().then(segments => {
-        sendResponse({
-          enabled: isEnabled,
-          captured: segments.length,
-          totalSize: segments.reduce((sum, s) => sum + s.size, 0),
-          files: segments.map(s => ({ filename: s.filename, size: s.size }))
-        });
-      });
-    });
-    return true;
+    await maintain();
+    const session = (await CaptureDB.all('sessions')).find(s => s.tabId === message.tabId);
+    if (!session) return { session: null };
+    const records = await CaptureDB.all('records', session.id);
+    return { session, captured: records.filter(r => r.state === 'complete').length,
+      totalSize: records.reduce((sum, r) => sum + r.size, 0), pending: records.filter(r => r.state === 'pending').length,
+      failed: records.filter(r => r.state === 'failed').length };
   }
-  
-  if (message.action === 'toggle') {
-    isEnabled = !isEnabled;
-    chrome.storage.local.set({ isEnabled });
-    sendResponse({ enabled: isEnabled });
-    return false;
+  if (message.action === 'setEnabled') {
+    const session = await requireSession(message.sessionId);
+    session.enabled = !!message.enabled; session.generation++;
+    await CaptureDB.put('sessions', session);
+    await chrome.storage.local.set({ isEnabled: session.enabled });
+    await sendState(session);
+    return {};
   }
-  
   if (message.action === 'clear') {
-    clearDB().then(() => sendResponse({ success: true }));
-    return true;
+    const old = await requireSession(message.sessionId);
+    await CaptureDB.removeSession(old.id);
+    const next = { ...old, id: crypto.randomUUID(), sequence: 0, generation: old.generation + 1, error: '' };
+    await CaptureDB.put('sessions', next);
+    await sendState(next);
+    return {};
   }
-  
-  if (message.action === 'downloadAll') {
-    downloadAllSegments().then(() => sendResponse({ success: true }));
-    return true;
+  if (message.action === 'snapshot') {
+    const session = await requireSession(message.sessionId);
+    if (session.error) throw new Error('収録に欠落があります。クリアして収録し直してください。');
+    const recordIds = (await CaptureDB.all('records', session.id)).map(r => r.id);
+    if (!recordIds.length) throw new Error('蓄積データがありません。');
+    const job = { id: crypto.randomUUID(), sessionId: session.id, recordIds, created: Date.now() };
+    await CaptureDB.put('exports', job);
+    await chrome.tabs.create({ url: chrome.runtime.getURL(`export.html?id=${job.id}`) });
+    return {};
   }
-  
-  if (message.action === 'downloadSingle') {
-    downloadSingleSegment(message.filename).then(() => sendResponse({ success: true }));
-    return true;
-  }
+  throw new Error('不明な操作です。');
+}
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  serialize(() => handle(message, sender)).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
+  return true;
 });
-
-// 全セグメントをダウンロード
-async function downloadAllSegments() {
-  const segments = await getAllSegments();
-  
-  for (const segment of segments) {
-    await downloadSegment(segment);
-    // レート制限回避のため少し待つ
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
-
-// 単一セグメントをダウンロード
-async function downloadSingleSegment(filename) {
-  const segments = await getAllSegments();
-  const segment = segments.find(s => s.filename === filename);
-  if (segment) {
-    await downloadSegment(segment);
-  }
-}
-
-// ダウンロード実行
-async function downloadSegment(segment) {
-  const blob = new Blob([segment.data], { type: 'video/mp2t' });
-  const dataUrl = await blobToDataUrl(blob);
-  
-  return chrome.downloads.download({
-    url: dataUrl,
-    filename: `hls_segments/${segment.filename}`,
-    saveAs: false
+chrome.tabs.onRemoved.addListener(tabId => serialize(async () => {
+  await ready;
+  for (const s of await CaptureDB.all('sessions')) if (s.tabId === tabId) await CaptureDB.removeSession(s.id);
+}));
+chrome.webNavigation.onCommitted.addListener(details => {
+  if (details.frameId !== 0) return;
+  serialize(async () => {
+    await ready;
+    for (const s of await CaptureDB.all('sessions')) if (s.tabId === details.tabId && s.documentId !== details.documentId) await CaptureDB.removeSession(s.id);
   });
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
+});
+chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
+  if (details.frameId !== 0) return;
+  serialize(async () => {
+    await ready;
+    for (const old of await CaptureDB.all('sessions')) {
+      if (old.tabId !== details.tabId || old.pageUrl === details.url) continue;
+      await CaptureDB.removeSession(old.id);
+      const next = { ...old, id: crypto.randomUUID(), generation: old.generation + 1,
+        pageUrl: details.url, sequence: 0, error: '' };
+      await CaptureDB.put('sessions', next);
+      await sendState(next);
+    }
   });
-}
+});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'capture-maintenance') serialize(async () => { await ready; await maintain(); });
+});
+chrome.runtime.onStartup.addListener(() => serialize(async () => { await ready; }));
