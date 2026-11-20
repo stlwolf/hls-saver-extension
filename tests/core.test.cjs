@@ -184,3 +184,29 @@ test('TS sync bytes are checked even when network chunks split a packet boundary
   bytes[188] = 0;
   await assert.rejects(() => media.validate({ id: 'ts', chunks: 2, size: 376 }, 'ts', async (_, index) => ({ data: index ? bytes.subarray(4) : bytes.subarray(0, 4) })), /TSとして/);
 });
+test('TS validation rejects empty, one-byte and incomplete final packets before reading data', async () => {
+  const media = context().CaptureMedia;
+  for (const size of [0, 1, 187, 189, 377]) {
+    await assert.rejects(() => media.validate({ id: 'truncated', size, chunks: 1 }, 'ts', async () => {
+      const data = new Uint8Array(Math.max(1, size)); data[0] = 71; if (data.length > 188) data[188] = 71; return { data };
+    }), /188|不完全/);
+  }
+});
+test('incremental playlist history preserves ordering without retaining every raw version', () => {
+  const h = context().HLSPlaylist;
+  const playlist = h.create('https://video.test/index.m3u8');
+  for (let index = 0; index < 300; index++) h.addVersion(playlist, list(['a.ts', 'b.ts']) + '\n#' + 'padding'.repeat(1000), playlist.url);
+  const plan = h.planPlaylist(playlist, [rec('b.ts', 1), rec('a.ts', 2)]);
+  assert.deepEqual(Array.from(plan.parts, p => p.url), ['https://video.test/a.ts', 'https://video.test/b.ts']);
+  assert.equal(playlist.segments.size, 2);
+  assert.ok(!JSON.stringify(playlist).includes('padding'));
+});
+test('unsupported audio playlist cannot prevent exporting a supported video playlist', () => {
+  const h = context().HLSPlaylist;
+  const audio = h.create('https://video.test/audio.m3u8');
+  const video = h.create('https://video.test/video.m3u8');
+  h.addVersion(audio, '#EXTM3U\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\na.ts', audio.url);
+  h.addVersion(video, list(['v.ts']), video.url);
+  assert.throws(() => h.planPlaylist(audio, [rec('a.ts')]), /EXT-X-SKIP/);
+  assert.equal(h.planPlaylist(video, [rec('v.ts')]).count, 1);
+});

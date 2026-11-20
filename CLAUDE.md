@@ -4,12 +4,12 @@ This is a vanilla-JavaScript Chrome MV3 extension. Read README.md for user behav
 
 ## Components
 
-- `content-main.js`: page-world fetch/XHR wrappers; copies successful playback responses, never refetches or waits on storage before returning playback responses. Generation checks gate capture, and queue limits fail visibly.
+- `content-main.js`: page-world fetch/XHR wrappers; copies successful playback responses, never refetches or waits on storage before returning playback responses. Bounded startup candidates await the initial ON/OFF decision. Request URLs resolve against document.baseURI before awaiting responses. Generation checks gate capture, and queue limits fail visibly.
 - `content-isolated.js`: allowlisted MAIN-to-extension message bridge and acknowledged capture-state changes.
 - `background.js`: serialized lifecycle/capture/control lane, browser epoch, document validation, session cleanup and immutable export snapshots.
 - `storage.js`: extension-origin IndexedDB sessions, record metadata, binary chunks and exports. Mutations acknowledge transaction commit. Shared by worker and export page.
-- `playlist.js`: conservative HLS merge planning without network access.
-- `media.js`: bounded TS/fMP4 header validation across arbitrary stored chunk boundaries.
+- `playlist.js`: conservative HLS merge planning without network access; folds versions incrementally into per-playlist metadata and isolates each playlist's parse errors.
+- `media.js`: bounded TS/fMP4 header validation across arbitrary stored chunk boundaries, with positive integral 188-byte TS packet counts.
 - `export.html` / `export.js`: stable snapshot, explicit playlist choice, sequential File System Access writes, cancellation and source-session invalidation.
 - `popup.html` / `popup.js`: active-tab capture controls and metadata-only stats.
 - `ui.css`: shared UI styles.

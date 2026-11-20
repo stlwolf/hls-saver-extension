@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const jobId = new URLSearchParams(location.search).get('id');
-let job, records, versions, selectedPlan, invalid = false, running = false, cancelled = false, writer;
+let job, records, playlists, selectedPlan, invalid = false, running = false, cancelled = false, writer;
 const showError = error => { $('error').textContent = error.message || String(error); };
 async function checkSession() {
   const epoch = (await chrome.storage.session.get('captureEpoch')).captureEpoch;
@@ -25,7 +25,7 @@ function selectPlaylist() {
   $('error').textContent = ''; $('details').textContent = ''; $('warning').textContent = '';
   try {
     const url = $('playlist').value;
-    selectedPlan = HLSPlaylist.plan(versions.filter(v => v.url === url), records);
+    selectedPlan = HLSPlaylist.planPlaylist(playlists.get(url), records);
     $('details').textContent = `${selectedPlan.count} 断片・${(selectedPlan.bytes / 1024 / 1024).toFixed(1)} MiB`;
     $('warning').textContent = selectedPlan.partial ? 'プレイリストの一部だけが収録されています。収録範囲のみを書き出します。' : '蓄積された範囲を書き出します。ライブや別音声を含む動画では、動画全体を取得できたことを意味しません。';
   } catch (error) { showError(error); }
@@ -49,13 +49,26 @@ async function load() {
     await new Promise(resolve => setTimeout(resolve, 300));
   }
   records.sort((a, b) => a.sequence - b.sequence);
-  versions = [];
+  playlists = new Map();
   for (const record of records) {
-    if (/\.m3u8(?:[?#]|$)/i.test(record.url) || /\.m3u8(?:[?#]|$)/i.test(record.responseUrl)) versions.push({ url: record.url, base: record.responseUrl || record.url, text: await textOf(record) });
+    if (!/\.m3u8(?:[?#]|$)/i.test(record.url) && !/\.m3u8(?:[?#]|$)/i.test(record.responseUrl)) continue;
+    await checkSession();
+    if (!playlists.has(record.url)) playlists.set(record.url, HLSPlaylist.create(record.url));
+    const playlist = playlists.get(record.url);
+    if (playlist.error) continue;
+    try {
+      HLSPlaylist.addVersion(playlist, await textOf(record), record.responseUrl || record.url);
+    } catch (error) { playlist.error = error.message; }
   }
-  const urls = [...new Set(versions.filter(v => !HLSPlaylist.parse(v.text, v.base).master).map(v => v.url))];
-  if (!urls.length) throw new Error('断片の順序を決めるプレイリストがありません。ONにした状態でリロードして再生してください。');
-  for (const url of urls) { const option = document.createElement('option'); option.value = url; option.textContent = url; $('playlist').append(option); }
+  const choices = [...playlists.values()].filter(playlist => !playlist.master);
+  if (!choices.length) throw new Error('断片の順序を決めるプレイリストがありません。ONにした状態でリロードして再生してください。');
+  for (const playlist of choices) {
+    const option = document.createElement('option'); option.value = playlist.url;
+    option.textContent = playlist.error ? `${playlist.url}（結合不可）` : playlist.url;
+    $('playlist').append(option);
+  }
+  const preferred = choices.find(playlist => !playlist.error);
+  if (preferred) $('playlist').value = preferred.url;
   $('playlist').disabled = false;
   $('status').textContent = '書き出すプレイリストを選んでください。';
   selectPlaylist();

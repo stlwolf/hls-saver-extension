@@ -5,7 +5,33 @@
   const CHUNK = 192 * 1024;
   const MAX_PENDING = 8 * 1024 * 1024;
   const MAX_RECORD = 32 * 1024 * 1024;
-  let state = { enabled: false, generation: 0, sessionId: null };
+  let state = { initialized: false, enabled: false, generation: 0, sessionId: null };
+  function createInitialization() {
+    let resolve;
+    const initial = { settled: false, attempted: false, value: null, promise: new Promise(done => { resolve = done; }) };
+    const timer = setTimeout(() => initial.complete(null), 10000);
+    initial.complete = value => {
+      if (initial.settled) return;
+      initial.settled = true; initial.value = value;
+      clearTimeout(timer); resolve(value);
+    };
+    return initial;
+  }
+  let initialization = createInitialization();
+  function requestStart(url, method) {
+    if (state.initialized) return { ...state };
+    if (method !== 'HEAD' && TARGET.test(url)) initialization.attempted = true;
+    return { initialization };
+  }
+  async function decisionFor(start) {
+    if (!start.initialization) return start;
+    const value = await start.initialization.promise;
+    return start.initialization === initialization ? value : null;
+  }
+  function mayCapture(start) {
+    if (!start.initialization) return isCurrent(start);
+    return start.initialization === initialization && (!initialization.settled || isCurrent(initialization.value));
+  }
   let active = 0, pendingBytes = 0;
   const replies = new Map();
   function rpc(message) {
@@ -17,14 +43,22 @@
     });
   }
   function report(error, capturedState) {
-    if (state.sessionId === capturedState.sessionId) state.enabled = false;
-    void rpc({ action: 'captureError', sessionId: capturedState.sessionId, error: error.message }).catch(() => {});
+    void decisionFor(capturedState).then(decision => {
+      if (!isCurrent(decision)) return;
+      state.enabled = false;
+      return rpc({ action: 'captureError', sessionId: decision.sessionId, error: error.message });
+    }).catch(() => {});
   }
   window.addEventListener('message', event => {
     if (event.source !== window) return;
     if (event.data?.type === 'HLS_SAVER_STATE') {
       const next = event.data.state;
-      if (next && typeof next.enabled === 'boolean' && typeof next.sessionId === 'string' && next.generation >= state.generation) state = next;
+      if (next && typeof next.enabled === 'boolean' && typeof next.sessionId === 'string' && next.generation >= state.generation) {
+        const expired = initialization.settled && !initialization.value && initialization.attempted;
+        state = { ...next, initialized: true };
+        initialization.complete({ ...state });
+        if (expired && state.enabled) report(new Error('収録の初期化が遅れ、開始時のデータを保持できませんでした。リロードしてください。'), { ...state });
+      }
       if (event.data.requestId) window.postMessage({ type: 'HLS_SAVER_STATE_APPLIED', requestId: event.data.requestId }, '*');
     }
     if (event.data?.type === 'HLS_SAVER_REPLY') {
@@ -35,13 +69,14 @@
       else waiting.reject(new Error(event.data.result?.error || '保存に失敗しました。'));
     }
   });
-  const isCurrent = start => start.enabled && state.enabled && start.sessionId === state.sessionId && start.generation === state.generation;
+  const isCurrent = start => start?.enabled && state.enabled && start.sessionId === state.sessionId && start.generation === state.generation;
   function encode(bytes) {
     let text = '';
     for (let offset = 0; offset < bytes.length; offset += 8192) text += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
     return btoa(text);
   }
   async function capture(stream, meta, start) {
+    if (start.initialization) start.initialization.attempted = true;
     const reader = stream.getReader();
     if (active >= 32 || meta.length > MAX_RECORD) {
       void reader.cancel().catch(() => {});
@@ -49,20 +84,23 @@
       return;
     }
     active++;
-    let recordId, chunks = 0, total = 0, failed = null;
+    let recordId, captureState, chunks = 0, total = 0, failed = null, skipped = false;
     const deadline = setTimeout(() => {
       failed = new Error('断片の収録がタイムアウトしました。');
       void reader.cancel().catch(() => {});
     }, 30000);
     // Drain the clone promptly. Waiting on each DB ACK here would let the tee buffer grow.
     // Jobs are capped globally; on overload we cancel our branch instead of slowing playback.
-    let writes = rpc({ action: 'begin', sessionId: start.sessionId, generation: start.generation,
-      url: meta.url, responseUrl: meta.responseUrl, range: meta.range, mime: meta.mime }).then(result => {
+    let writes = decisionFor(start).then(async decision => {
+      if (!isCurrent(decision)) { skipped = true; void reader.cancel().catch(() => {}); return; }
+      captureState = decision;
+      const result = await rpc({ action: 'begin', sessionId: decision.sessionId, generation: decision.generation,
+        url: meta.url, responseUrl: meta.responseUrl, range: meta.range, mime: meta.mime });
       recordId = result.recordId;
-      if (result.skipped) { failed = new Error('収録の切り替えにより受付を終了しました。'); void reader.cancel().catch(() => {}); }
+      if (result.skipped) { skipped = true; void reader.cancel().catch(() => {}); }
     }).catch(error => { failed = error; void reader.cancel().catch(() => {}); });
     try {
-      while (!failed) {
+      while (!failed && !skipped) {
         const { value, done } = await reader.read();
         if (done) break;
         total += value.byteLength;
@@ -73,7 +111,7 @@
           pendingBytes += bytes.length;
           const index = chunks++;
           writes = writes.then(async () => {
-            if (!failed && recordId) await rpc({ action: 'chunk', sessionId: start.sessionId, recordId, index, data: encode(bytes) });
+            if (!failed && recordId) await rpc({ action: 'chunk', sessionId: captureState.sessionId, recordId, index, data: encode(bytes) });
           }).catch(error => { failed = error; void reader.cancel().catch(() => {}); })
             .finally(() => { pendingBytes -= bytes.length; });
         }
@@ -86,21 +124,21 @@
     clearTimeout(deadline);
     try {
       if (recordId) {
-        if (failed) await rpc({ action: 'fail', sessionId: start.sessionId, recordId, error: failed.message });
-        else await rpc({ action: 'finish', sessionId: start.sessionId, recordId, chunks });
-      } else if (failed && isCurrent(start)) report(failed, start);
-    } catch (error) { if (isCurrent(start)) report(error, start); }
+        if (failed) await rpc({ action: 'fail', sessionId: captureState.sessionId, recordId, error: failed.message });
+        else await rpc({ action: 'finish', sessionId: captureState.sessionId, recordId, chunks });
+      } else if (failed) report(failed, start);
+    } catch (error) { report(error, start); }
     finally { active--; }
   }
   const originalFetch = window.fetch;
   window.fetch = async function(...args) {
-    const start = { ...state };
-    const response = await originalFetch.apply(this, args);
     const input = args[0];
-    const url = new URL(input?.url || String(input), location.href).href;
-    const responseUrl = response.url || url;
+    const url = new URL(input?.url || String(input), document.baseURI).href;
     const method = String(args[1]?.method || input?.method || 'GET').toUpperCase();
-    if (method !== 'HEAD' && isCurrent(start) && (TARGET.test(url) || TARGET.test(responseUrl)) && response.ok && response.body) {
+    const start = requestStart(url, method);
+    const response = await originalFetch.apply(this, args);
+    const responseUrl = response.url || url;
+    if (method !== 'HEAD' && mayCapture(start) && (TARGET.test(url) || TARGET.test(responseUrl)) && response.ok && response.body) {
       try {
         void capture(response.clone().body, { url, responseUrl, range: response.headers.get('content-range') || '',
           mime: response.headers.get('content-type') || '', length: Number(response.headers.get('content-length')) }, start);
@@ -115,17 +153,17 @@
     const previous = xhrInfo.get(this);
     if (previous?.onLoad) this.removeEventListener('load', previous.onLoad);
     const result = originalOpen.apply(this, [method, url, ...rest]);
-    xhrInfo.set(this, { url: new URL(String(url), location.href).href, method: String(method).toUpperCase() });
+    xhrInfo.set(this, { url: new URL(String(url), document.baseURI).href, method: String(method).toUpperCase() });
     return result;
   };
   XMLHttpRequest.prototype.send = function(...args) {
     const info = xhrInfo.get(this);
-    const start = { ...state };
-    if (info && info.method !== 'HEAD' && start.enabled) {
+    const start = info && requestStart(info.url, info.method);
+    if (info && info.method !== 'HEAD' && mayCapture(start)) {
       info.onLoad = () => {
         const url = info.url;
         const responseUrl = this.responseURL || url;
-        if (!isCurrent(start) || !(TARGET.test(url) || TARGET.test(responseUrl)) || this.status < 200 || this.status >= 300) return;
+        if (!mayCapture(start) || !(TARGET.test(url) || TARGET.test(responseUrl)) || this.status < 200 || this.status >= 300) return;
         try {
           let blob;
           if (this.response instanceof ArrayBuffer || this.response instanceof Blob) blob = new Blob([this.response]);
@@ -143,8 +181,12 @@
   };
   // A BFCache restore is a new capture session: old stored data has already been released.
   window.addEventListener('pageshow', event => {
-    if (event.persisted) { state = { enabled: false, generation: 0, sessionId: null }; window.postMessage({ type: 'HLS_SAVER_READY' }, '*'); }
+    if (event.persisted) {
+      state = { initialized: false, enabled: false, generation: 0, sessionId: null };
+      initialization = createInitialization();
+      window.postMessage({ type: 'HLS_SAVER_READY' }, '*');
+    }
   });
-  window.addEventListener('pagehide', () => { state.enabled = false; });
+  window.addEventListener('pagehide', () => { state.enabled = false; initialization.attempted = false; initialization.complete(null); });
   window.postMessage({ type: 'HLS_SAVER_READY' }, '*');
 })();

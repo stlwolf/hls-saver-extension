@@ -58,18 +58,28 @@
     return part.range ? range?.start === part.range.start && range.end === part.range.end && record.size === range.end - range.start + 1 : range === null;
   }
   const identity = part => JSON.stringify([part.uri, part.range, part.init, part.key, part.discontinuitySequence]);
-  function plan(versions, records) {
-    const merged = new Map();
-    for (const version of versions) {
-      const parsed = parse(version.text, version.base || version.url);
-      if (parsed.master) continue;
+  const create = url => ({ url, segments: new Map(), master: false, error: null });
+  function addVersion(playlist, text, base = playlist.url) {
+    if (playlist.error) return;
+    try {
+      const parsed = parse(text, base);
+      playlist.master = parsed.master;
+      if (parsed.master) return;
       for (const part of parsed.segments) {
-        const old = merged.get(part.sequence);
+        const old = playlist.segments.get(part.sequence);
         if (old && identity(old) !== identity(part)) throw new Error('同じ再生位置の構成が変わっています。リロードして収録を分けてください。');
-        merged.set(part.sequence, old ? { ...part, discontinuity: old.discontinuity || part.discontinuity } : part);
+        playlist.segments.set(part.sequence, old ? { ...part, discontinuity: old.discontinuity || part.discontinuity } : part);
       }
-    }
-    const segments = [...merged.values()].sort((a, b) => a.sequence - b.sequence);
+    } catch (error) { playlist.error = error.message; }
+  }
+  function plan(versions, records) {
+    const playlist = create(versions[0]?.url || '');
+    for (const version of versions) addVersion(playlist, version.text, version.base || version.url);
+    return planPlaylist(playlist, records);
+  }
+  function planPlaylist(playlist, records) {
+    if (playlist.error) throw new Error(playlist.error);
+    const segments = [...playlist.segments.values()].sort((a, b) => a.sequence - b.sequence);
     const addressOf = (url, range) => JSON.stringify([url, range?.start ?? null, range?.end ?? null]);
     const captured = new Map();
     for (const record of records) {
@@ -112,5 +122,5 @@
       first: selected[0].sequence, last: selected[selected.length - 1].sequence,
       partial: first > 0 || last < segments.length - 1, bytes: parts.reduce((sum, r) => sum + r.size, 0) };
   }
-  globalThis.HLSPlaylist = { parse, plan };
+  globalThis.HLSPlaylist = { parse, plan, create, addVersion, planPlaylist };
 })();

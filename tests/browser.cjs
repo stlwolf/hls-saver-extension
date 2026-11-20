@@ -25,7 +25,15 @@ const errors = [];
   server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
     requests.set(url.pathname, (requests.get(url.pathname) || 0) + 1);
-    if (url.pathname === '/') { res.setHeader('content-type', 'text/html'); res.end('<!doctype html><title>Playback fixture</title><video controls></video>'); return; }
+    if (url.pathname === '/') {
+      res.setHeader('content-type', 'text/html');
+      res.end('<!doctype html><title>Playback fixture</title><video controls></video><script>window.startupDone=(async()=>{await(await fetch("/startup/index.m3u8")).text();await(await fetch("/startup/startup.ts")).arrayBuffer()})()</script>'); return;
+    }
+    if (url.pathname === '/startup/index.m3u8') { res.end('#EXTM3U\n#EXTINF:1,\nstartup.ts\n#EXT-X-ENDLIST'); return; }
+    if (url.pathname === '/startup/startup.ts') { const bytes = Buffer.alloc(188); bytes[0] = 71; res.end(bytes); return; }
+    if (/^\/unsupported\/(ts|fmp4)\.m3u8$/.test(url.pathname)) { res.end('#EXTM3U\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\naudio.ts'); return; }
+    if (url.pathname === '/truncated/index.m3u8') { res.end('#EXTM3U\n#EXTINF:1,\nbad.ts\n#EXT-X-ENDLIST'); return; }
+    if (url.pathname === '/truncated/bad.ts') { res.end(Buffer.from([71])); return; }
     if (url.pathname === '/head/index.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(); return; }
     if (/^\/(ts|fmp4)\/index\.m3u8$/.test(url.pathname)) { res.writeHead(302, { location: '/media' + url.pathname }); res.end(); return; }
     if (/^\/media\/(ts|fmp4)\/(?!index\.m3u8$)/.test(url.pathname)) { res.writeHead(302, { location: url.pathname.replace('/media/', '/delivery/') }); res.end(); return; }
@@ -53,6 +61,14 @@ const errors = [];
   });
   context.on('page', page => page.on('pageerror', error => errors.push(error.message)));
   const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
+  // Delay registration deterministically while the page's parser starts one-shot requests.
+  await worker.evaluate(() => {
+    globalThis.originalGetFrame = chrome.webNavigation.getFrame;
+    chrome.webNavigation.getFrame = async (...args) => {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      return globalThis.originalGetFrame.apply(chrome.webNavigation, args);
+    };
+  });
   const extension = worker.url().split('/')[2];
   const control = await context.newPage();
   await control.goto(`chrome-extension://${extension}/popup.html`);
@@ -71,13 +87,36 @@ const errors = [];
   };
   const stats = () => send({ action: 'getStats', tabId });
   let session = (await wait(async () => (await stats()).session)).id;
+  await playback.evaluate(() => window.startupDone);
+  await wait(async () => (await stats()).captured === 2 && !(await stats()).pending);
+  await worker.evaluate(() => { chrome.webNavigation.getFrame = globalThis.originalGetFrame; delete globalThis.originalGetFrame; });
+  console.log('PASS startup: inline one-shot playback requests survive delayed registration');
+  await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id;
   await playback.evaluate(() => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(); xhr.open('HEAD', '/head/index.m3u8');
     xhr.onload = resolve; xhr.onerror = reject; xhr.send();
   }));
   assert.equal((await stats()).captured, 0); assert.equal((await stats()).session.error, '');
   console.log('PASS HEAD XHR: no empty capture or session failure');
+  await playback.evaluate(async () => {
+    await (await fetch('/truncated/index.m3u8')).text(); await (await fetch('/truncated/bad.ts')).arrayBuffer();
+  });
+  await wait(async () => (await stats()).captured === 2 && !(await stats()).pending);
+  const badPageEvent = context.waitForEvent('page');
+  await send({ action: 'snapshot', sessionId: session }); const badOutput = await badPageEvent;
+  await wait(() => badOutput.locator('#save').isEnabled());
+  await badOutput.evaluate(() => {
+    window.showSaveFilePicker = async () => (await navigator.storage.getDirectory()).getFileHandle('bad-output', { create: true });
+  });
+  await badOutput.locator('#save').click();
+  await badOutput.waitForFunction(() => document.getElementById('status').textContent === '書き出しに失敗しました。');
+  assert.match(await badOutput.locator('#error').textContent(), /188/);
+  assert.equal(await badOutput.evaluate(async () => (await (await (await navigator.storage.getDirectory()).getFileHandle('bad-output')).getFile()).size), 0);
+  await badOutput.close();
+  await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id;
+  console.log('PASS truncated TS: one-byte response cannot produce a successful export');
   const fetchFiles = async type => playback.evaluate(async type => {
+    await (await fetch(`/unsupported/${type}.m3u8`)).text();
     const response = await fetch(`/${type}/index.m3u8`);
     const base = response.url;
     const text = await response.text();
@@ -88,7 +127,7 @@ const errors = [];
   for (const type of ['ts', 'fmp4']) {
     if (type === 'fmp4') { await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id; }
     await fetchFiles(type);
-    const captured = await wait(async () => { const s = await stats(); return !s.pending && s.captured >= (type === 'ts' ? 4 : 5) && s; });
+    const captured = await wait(async () => { const s = await stats(); return !s.pending && s.captured >= (type === 'ts' ? 5 : 6) && s; });
     assert.equal(captured.failed, 0); assert.equal(captured.session.error, '');
     if (type === 'fmp4') {
       const headerBytes = await control.evaluate(async sessionId => {
@@ -104,6 +143,12 @@ const errors = [];
     await output.waitForURL(`chrome-extension://${extension}/export.html?id=*`);
     await output.locator('#save').waitFor({ state: 'visible' });
     await wait(() => output.locator('#save').isEnabled());
+    await output.locator('#playlist').selectOption(`${origin}/unsupported/${type}.m3u8`);
+    assert.equal(await output.locator('#save').isEnabled(), false);
+    assert.match(await output.locator('#error').textContent(), /EXT-X-SKIP/);
+    await output.locator('#playlist').selectOption(`${origin}/${type}/index.m3u8`);
+    assert.equal(await output.locator('#save').isEnabled(), true);
+    console.log(`PASS ${type}: unsupported alternate playlist is isolated from supported output`);
     await output.evaluate(() => {
       window.showSaveFilePicker = async () => {
         window.pickerHadActivation = navigator.userActivation.isActive;
@@ -142,7 +187,9 @@ const errors = [];
   assert.equal((await stats()).captured, before);
   console.log('PASS OFF: playback response still readable; no new capture');
   await playback.reload();
+  await playback.evaluate(() => window.startupDone);
   await wait(async () => (await stats()).session?.id !== session);
+  assert.equal((await stats()).captured, 0);
   const remaining = await control.evaluate(async id => {
     await import(chrome.runtime.getURL('storage.js'));
     return { session: await CaptureDB.get('sessions', id), records: await CaptureDB.all('records', id), chunks: await CaptureDB.all('chunks') };
@@ -166,6 +213,21 @@ const errors = [];
   assert.equal(bulkStats.failed, 0); assert.equal(bulkStats.session.error, '');
   assert.equal(bulkStats.captured, bulkCount + 1);
   assert.ok(captureAfter - captureBefore < 24 * 1024 * 1024, 'Capture retained too much JS heap');
+  // Seed a large repeated live-playlist history in real IDB. Export must fold it,
+  // rather than retain 32+ MiB of decoded raw versions in the extension page.
+  await control.evaluate(async sessionId => {
+    const rows = await CaptureDB.all('records', sessionId);
+    const template = rows.find(r => r.url.endsWith('/bulk/index.m3u8'));
+    const body = (await CaptureDB.get('chunks', [template.id, 0])).data;
+    const text = new TextDecoder().decode(body) + '\n#' + 'x'.repeat(128 * 1024);
+    const data = new TextEncoder().encode(text);
+    const sequence = Math.max(...rows.map(r => r.sequence));
+    for (let index = 0; index < 256; index++) {
+      const id = crypto.randomUUID();
+      await CaptureDB.put('chunks', { recordId: id, index: 0, data });
+      await CaptureDB.put('records', { ...template, id, sequence: sequence + index + 1, chunks: 1, size: data.byteLength });
+    }
+  }, session);
   const bulkPageEvent = context.waitForEvent('page');
   await send({ action: 'snapshot', sessionId: session });
   const bulkOutput = await bulkPageEvent;
@@ -183,6 +245,8 @@ const errors = [];
   const exportCDP = await context.newCDPSession(bulkOutput);
   await exportCDP.send('HeapProfiler.collectGarbage');
   const exportBefore = await bulkOutput.evaluate(() => performance.memory.usedJSHeapSize);
+  assert.ok(exportBefore < 16 * 1024 * 1024, 'Playlist history retained raw text instead of folding metadata');
+  console.log(`PASS playlist history: 32+ MiB of repeated raw versions folded; retained JS heap ${(exportBefore / 1024 / 1024).toFixed(1)} MiB`);
   await bulkOutput.locator('#save').click();
   await bulkOutput.waitForFunction(() => document.getElementById('status').textContent.startsWith('書き出しが完了'), { timeout: 60000 });
   await exportCDP.send('HeapProfiler.collectGarbage');
@@ -213,7 +277,7 @@ const errors = [];
   assert.equal((await control.evaluate(async () => (await CaptureDB.all('chunks')).length)), 0);
   console.log('PASS tab close: invalidates export and releases binary chunks');
   for (const [url, count] of requests) if (/\.(m3u8|ts|m4s|mp4)$/.test(url)) {
-    assert.equal(count, url === '/ts/seg0.ts' ? 2 : 1, `Unexpected refetch: ${url} (${count})`);
+    assert.equal(count, ['/ts/seg0.ts', '/startup/index.m3u8', '/startup/startup.ts'].includes(url) ? 2 : 1, `Unexpected refetch: ${url} (${count})`);
   }
   assert.deepEqual(errors, []);
   console.log('PASS network: no extension refetches; no uncaught page errors');

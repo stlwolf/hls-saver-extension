@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const { webcrypto } = require('node:crypto');
-function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), pauseBegin = false } = {}) {
+function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), pauseBegin = false, baseURI = 'https://video.test/' } = {}) {
   const listeners = new Map();
   const messages = [];
   let release;
@@ -21,7 +21,8 @@ function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), paus
     else queueMicrotask(reply);
   };
   w.fetch = async () => response();
-  const c = vm.createContext({ window: w, XMLHttpRequest: XHR, crypto: webcrypto, URL, location: { href: 'https://video.test/' },
+  const document = { baseURI };
+  const c = vm.createContext({ window: w, document, XMLHttpRequest: XHR, crypto: webcrypto, URL, location: { href: 'https://video.test/' },
     ArrayBuffer, Uint8Array, Blob, btoa, setTimeout, clearTimeout, console });
   vm.runInContext(fs.readFileSync(`${__dirname}/../content-main.js`, 'utf8'), c);
   const set = (enabled, generation) => emit({ type: 'HLS_SAVER_STATE', state: { sessionId: 'session', enabled, generation } });
@@ -30,7 +31,7 @@ function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), paus
     while (Date.now() < end) { if (messages.some(m => m.action === action)) return; await new Promise(r => setTimeout(r, 5)); }
     throw new Error(`Missing action ${action}: ${JSON.stringify(messages.map(m => m.action))}`);
   };
-  return { w, XHR, set, messages, waitFor, release: () => release?.() };
+  return { w, document, XHR, set, messages, waitFor, release: () => release?.() };
 }
 test('fetch response is returned and readable before storage begin ACK; capture uses small encoded chunks', async () => {
   const s = setup({ pauseBegin: true }); s.set(true, 1);
@@ -99,4 +100,56 @@ test('redirected XHR preserves its original segment address', async () => {
   xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('finish');
   const begin = s.messages.find(m => m.action === 'begin');
   assert.equal(begin.url, 'https://video.test/original.ts'); assert.equal(begin.responseUrl, 'https://cdn.test/final.ts');
+});
+test('one-shot fetch completed before initialization is saved after the first ON decision', async () => {
+  const s = setup();
+  const response = await s.w.fetch('/early.ts');
+  assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [71, 1, 2]);
+  assert.equal(s.messages.filter(m => m.action === 'begin').length, 0);
+  s.set(true, 1); await s.waitFor('finish');
+  assert.equal(s.messages.find(m => m.action === 'begin').url, 'https://video.test/early.ts');
+});
+test('XHR completed before initialization is retained until ON without delaying load', async () => {
+  const s = setup();
+  const xhr = new s.XHR(); xhr.open('GET', '/early.m3u8'); xhr.responseType = ''; xhr.responseText = '#EXTM3U\na.ts'; xhr.status = 200;
+  xhr.send(); xhr.dispatchEvent(new Event('load'));
+  assert.equal(xhr.responseText, '#EXTM3U\na.ts');
+  s.set(true, 1); await s.waitFor('finish');
+});
+test('initial OFF discards startup candidates and a later ON cannot revive them', async () => {
+  const s = setup();
+  await (await s.w.fetch('/early.ts')).arrayBuffer();
+  s.set(false, 1); await new Promise(resolve => setTimeout(resolve, 20));
+  s.set(true, 2); await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(s.messages.filter(m => m.type === 'HLS_SAVER_REQUEST').length, 0);
+});
+test('fetch and XHR resolve the document base when the request starts', async () => {
+  let resolve;
+  const s = setup({ baseURI: 'https://video.test/media/', response: () => new Promise(r => { resolve = r; }) });
+  s.set(true, 1);
+  const pending = s.w.fetch('a.ts');
+  s.document.baseURI = 'https://video.test/changed/';
+  resolve(new Response(new Uint8Array([71]))); await pending; await s.waitFor('finish');
+  assert.equal(s.messages.find(m => m.action === 'begin').url, 'https://video.test/media/a.ts');
+  const xhr = new s.XHR(); xhr.open('GET', 'b.ts'); xhr.responseType = 'blob'; xhr.response = new Blob([new Uint8Array([71])]); xhr.status = 200;
+  s.document.baseURI = 'https://video.test/changed-again/';
+  xhr.send(); xhr.dispatchEvent(new Event('load'));
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(s.messages.filter(m => m.action === 'begin')[1].url, 'https://video.test/changed/b.ts');
+});
+test('startup buffering shares the queue limit and reports overload after the ON decision', async () => {
+  const s = setup({ response: () => new Response(new Uint8Array(9 * 1024 * 1024)) });
+  const response = await s.w.fetch('/large-startup.ts');
+  assert.equal((await response.arrayBuffer()).byteLength, 9 * 1024 * 1024);
+  assert.equal(s.messages.filter(m => m.action === 'begin').length, 0);
+  s.set(true, 1); await s.waitFor('fail');
+  assert.match(s.messages.find(m => m.action === 'fail').error, /追いつきません/);
+});
+test('startup request resolving after initial OFF and a subsequent ON is not revived', async () => {
+  let resolve;
+  const s = setup({ response: () => new Promise(done => { resolve = done; }) });
+  const pending = s.w.fetch('/early.ts'); s.set(false, 1); s.set(true, 2);
+  resolve(new Response(new Uint8Array([71]))); await pending;
+  await new Promise(done => setTimeout(done, 20));
+  assert.equal(s.messages.filter(m => m.type === 'HLS_SAVER_REQUEST').length, 0);
 });

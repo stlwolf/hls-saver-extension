@@ -2,6 +2,7 @@
 (() => {
   'use strict';
   async function validate(record, container, readChunk = (id, index) => CaptureDB.get('chunks', [id, index])) {
+    if (container === 'ts' && (!Number.isSafeInteger(record.size) || record.size <= 0 || record.size % 188 !== 0)) throw new Error('TS断片が不完全です。188バイト単位のパケットになっていません。');
     const needed = container === 'ts' ? Math.min(record.size, 189) : 8;
     const prefix = new Uint8Array(needed);
     let copied = 0;
