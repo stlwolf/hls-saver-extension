@@ -1,0 +1,20 @@
+* { box-sizing: border-box; }
+body { margin: 0; padding: 22px; color: #213044; background: #f6f8fb; font: 14px/1.6 system-ui, sans-serif; }
+body.popup { width: 350px; }
+body.export { max-width: 820px; margin: 36px auto; }
+main { background: white; padding: 28px; border: 1px solid #dce2eb; border-radius: 12px; }
+h1 { margin: 0 0 16px; font-size: 21px; }
+p { overflow-wrap: anywhere; }
+dl { display: grid; grid-template-columns: 1fr 1fr; margin: 18px 0; padding: 14px; background: white; border-radius: 8px; }
+dd { margin: 0; text-align: right; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.popup .actions { flex-direction: column; }
+button { padding: 11px 16px; border: 0; border-radius: 6px; background: #2160ae; color: white; cursor: pointer; font: inherit; }
+button.secondary { color: #734f08; background: #fff0cc; }
+button:disabled { opacity: .45; cursor: default; }
+button:focus-visible, select:focus-visible { outline: 3px solid #73a9e8; outline-offset: 3px; }
+select { display: block; width: 100%; padding: 10px; margin: 8px 0 16px; font: inherit; }
+progress { width: 100%; margin: 10px 0 22px; }
+.error { color: #a42121; white-space: pre-wrap; }
+.warning { color: #785512; }
+.muted { color: #657082; font-size: 12px; }
