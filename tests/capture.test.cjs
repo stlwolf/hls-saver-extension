@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const { webcrypto } = require('node:crypto');
-function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), pauseBegin = false, baseURI = 'https://video.test/' } = {}) {
+function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), pauseBegin = false, baseURI = 'https://video.test/', BlobClass = Blob } = {}) {
   const listeners = new Map();
   const messages = [];
   let release;
@@ -23,7 +23,7 @@ function setup({ response = () => new Response(new Uint8Array([71, 1, 2])), paus
   w.fetch = async () => response();
   const document = { baseURI };
   const c = vm.createContext({ window: w, document, XMLHttpRequest: XHR, crypto: webcrypto, URL, location: { href: 'https://video.test/' },
-    ArrayBuffer, Uint8Array, Blob, btoa, setTimeout, clearTimeout, console });
+    ArrayBuffer, Uint8Array, Blob: BlobClass, btoa, setTimeout, clearTimeout, console });
   vm.runInContext(fs.readFileSync(`${__dirname}/../content-main.js`, 'utf8'), c);
   const set = (enabled, generation) => emit({ type: 'HLS_SAVER_STATE', state: { sessionId: 'session', enabled, generation } });
   const waitFor = async action => {
@@ -152,4 +152,34 @@ test('startup request resolving after initial OFF and a subsequent ON is not rev
   resolve(new Response(new Uint8Array([71]))); await pending;
   await new Promise(done => setTimeout(done, 20));
   assert.equal(s.messages.filter(m => m.type === 'HLS_SAVER_REQUEST').length, 0);
+});
+for (const type of ['arraybuffer', 'blob']) {
+  test(`oversized XHR ${type} is rejected before creating another Blob`, async () => {
+    let constructions = 0;
+    const ObservedBlob = new Proxy(Blob, { construct(target, args, newTarget) {
+      constructions++; return Reflect.construct(target, args, newTarget);
+    } });
+    const s = setup({ BlobClass: ObservedBlob }); s.set(true, 1);
+    const response = type === 'arraybuffer' ? new ArrayBuffer(32 * 1024 * 1024 + 1) : new Blob([new Uint8Array(32 * 1024 * 1024 + 1)]);
+    const xhr = new s.XHR(); xhr.open('GET', '/oversized.ts'); xhr.responseType = type; xhr.response = response; xhr.status = 200;
+    xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('captureError');
+    assert.equal(constructions, 0, 'Size rejection must precede Blob construction');
+    assert.equal(xhr.response, response);
+    assert.equal(s.messages.filter(m => m.action === 'begin').length, 0);
+    assert.match(s.messages.find(m => m.action === 'captureError').error, /32 MiB/);
+  });
+}
+test('in-limit XHR Blob is streamed directly without constructing a wrapper Blob', async () => {
+  let constructions = 0, streams = 0;
+  const ObservedBlob = new Proxy(Blob, { construct(target, args, newTarget) {
+    constructions++; return Reflect.construct(target, args, newTarget);
+  } });
+  const s = setup({ BlobClass: ObservedBlob }); s.set(true, 1);
+  const response = new Blob([new Uint8Array([71, 4, 5])]);
+  response.stream = function() { streams++; return Blob.prototype.stream.call(this); };
+  const xhr = new s.XHR(); xhr.open('GET', '/small.ts'); xhr.responseType = 'blob'; xhr.response = response; xhr.status = 200;
+  xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('finish');
+  assert.equal(constructions, 0); assert.equal(streams, 1);
+  assert.equal(xhr.response, response);
+  assert.equal(s.messages.find(m => m.action === 'chunk').data, 'RwQF');
 });

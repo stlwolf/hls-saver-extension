@@ -166,8 +166,13 @@
         if (!mayCapture(start) || !(TARGET.test(url) || TARGET.test(responseUrl)) || this.status < 200 || this.status >= 300) return;
         try {
           let blob;
-          if (this.response instanceof ArrayBuffer || this.response instanceof Blob) blob = new Blob([this.response]);
-          else if (!this.responseType || this.responseType === 'text') {
+          if (this.response instanceof ArrayBuffer) {
+            if (this.response.byteLength > MAX_RECORD) throw new Error('1断片の上限（32 MiB）を超えました。');
+            blob = new Blob([this.response]);
+          } else if (this.response instanceof Blob) {
+            if (this.response.size > MAX_RECORD) throw new Error('1断片の上限（32 MiB）を超えました。');
+            blob = this.response;
+          } else if (!this.responseType || this.responseType === 'text') {
             if (!/\.m3u8(?:[?#]|$)/i.test(url) && !/\.m3u8(?:[?#]|$)/i.test(responseUrl)) throw new Error('テキスト形式の動画断片は保存できません。');
             blob = new Blob([this.responseText]);
           } else throw new Error('未対応のXHRレスポンス形式です。');
