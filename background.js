@@ -124,12 +124,17 @@ async function handle(message, sender) {
     const session = (await CaptureDB.all('sessions')).find(s => s.tabId === message.tabId);
     if (!session) return { session: null };
     const records = await CaptureDB.all('records', session.id);
-    return { session, captured: records.filter(r => r.state === 'complete').length,
+    const complete = records.filter(r => r.state === 'complete');
+    const isPlaylist = record => /\.m3u8(?:[?#]|$)/i.test(record.url) || /\.m3u8(?:[?#]|$)/i.test(record.responseUrl || '');
+    return { session, captured: complete.length,
+      mediaCaptured: complete.filter(r => !isPlaylist(r)).length,
+      playlistsCaptured: complete.filter(isPlaylist).length,
       totalSize: records.reduce((sum, r) => sum + r.size, 0), pending: records.filter(r => r.state === 'pending').length,
       failed: records.filter(r => r.state === 'failed').length };
   }
   if (message.action === 'setEnabled') {
     const session = await requireSession(message.sessionId);
+    if (message.enabled && session.error) throw new Error('収録に欠落があります。クリアしてONにした後、ページをリロードしてください。');
     session.enabled = !!message.enabled; session.generation++;
     await CaptureDB.put('sessions', session);
     await chrome.storage.local.set({ isEnabled: session.enabled });

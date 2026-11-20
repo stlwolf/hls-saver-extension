@@ -4,7 +4,7 @@ This is a vanilla-JavaScript Chrome MV3 extension. Read README.md for user behav
 
 ## Components
 
-- `content-main.js`: page-world fetch/XHR wrappers; copies successful playback responses, never refetches or waits on storage before returning playback responses. Bounded startup candidates await the initial ON/OFF decision. Request URLs resolve against document.baseURI before awaiting responses. Generation checks gate capture, and queue limits fail visibly.
+- `content-main.js`: page-world fetch/XHR wrappers; copies successful playback responses, never refetches or waits on storage before returning playback responses. Startup copies await the initial ON/OFF decision. Capture awaits each chunk's commit ACK before sending another; there is no eager whole-body send queue. Request URLs resolve against document.baseURI before awaiting responses. Resource limits and inactivity timeouts fail visibly. Native clone buffering is not included in the transfer bound.
 - `content-isolated.js`: allowlisted MAIN-to-extension message bridge and acknowledged capture-state changes.
 - `background.js`: serialized lifecycle/capture/control lane, browser epoch, document validation, session cleanup and immutable export snapshots.
 - `storage.js`: extension-origin IndexedDB sessions, record metadata, binary chunks and exports. Mutations acknowledge transaction commit. Shared by worker and export page.

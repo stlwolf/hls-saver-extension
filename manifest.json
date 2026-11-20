@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HLS Stream Saver",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "minimum_chrome_version": "120",
   "description": "Capture HLS segments without re-requesting",
   "permissions": [

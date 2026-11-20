@@ -22,6 +22,8 @@ const errors = [];
   const originalSegment = fs.readFileSync(path.join(tmp, 'ts', 'seg0.ts'));
   const bulkSegment = Buffer.concat(Array.from({ length: Math.ceil(512 * 1024 / originalSegment.length) }, () => originalSegment));
   const bulkCount = 128;
+  const largeSegment = Buffer.concat(Array.from({ length: Math.ceil(9 * 1024 * 1024 / originalSegment.length) }, () => originalSegment));
+  const burstSegment = Buffer.concat(Array.from({ length: Math.ceil(2 * 1024 * 1024 / originalSegment.length) }, () => originalSegment));
   server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
     requests.set(url.pathname, (requests.get(url.pathname) || 0) + 1);
@@ -31,6 +33,14 @@ const errors = [];
     }
     if (url.pathname === '/startup/index.m3u8') { res.end('#EXTM3U\n#EXTINF:1,\nstartup.ts\n#EXT-X-ENDLIST'); return; }
     if (url.pathname === '/startup/startup.ts') { const bytes = Buffer.alloc(188); bytes[0] = 71; res.end(bytes); return; }
+    if (/^\/(large|burst)\/index\.m3u8$/.test(url.pathname)) {
+      const count = url.pathname.startsWith('/large/') ? 1 : 6;
+      res.end('#EXTM3U\n' + Array.from({ length: count }, (_, i) => `#EXTINF:1,\n${i}.ts\n`).join('') + '#EXT-X-ENDLIST'); return;
+    }
+    if (/^\/(large|burst)\/\d+\.ts$/.test(url.pathname)) {
+      const body = url.pathname.startsWith('/large/') ? largeSegment : burstSegment;
+      res.setHeader('content-length', body.length); res.end(body); return;
+    }
     if (/^\/unsupported\/(ts|fmp4)\.m3u8$/.test(url.pathname)) { res.end('#EXTM3U\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\naudio.ts'); return; }
     if (url.pathname === '/truncated/index.m3u8') { res.end('#EXTM3U\n#EXTINF:1,\nbad.ts\n#EXT-X-ENDLIST'); return; }
     if (url.pathname === '/truncated/bad.ts') { res.end(Buffer.from([71])); return; }
@@ -92,6 +102,51 @@ const errors = [];
   await worker.evaluate(() => { chrome.webNavigation.getFrame = globalThis.originalGetFrame; delete globalThis.originalGetFrame; });
   console.log('PASS startup: inline one-shot playback requests survive delayed registration');
   await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id;
+  for (const type of ['large', 'burst']) {
+    const count = type === 'large' ? 1 : 6;
+    const bytes = type === 'large' ? largeSegment.length : burstSegment.length * count;
+    await playback.evaluate(async ({ type, count }) => {
+      await (await fetch(`/${type}/index.m3u8`)).text();
+      await Promise.all(Array.from({ length: count }, async (_, i) => {
+        const url = `/${type}/${i}.ts`;
+        if (i % 2 === 0) await (await fetch(url)).arrayBuffer();
+        else await new Promise((resolve, reject) => { const xhr = new XMLHttpRequest(); xhr.open('GET', url); xhr.responseType = 'blob'; xhr.onload = resolve; xhr.onerror = reject; xhr.send(); });
+      }));
+    }, { type, count });
+    await wait(async () => { const s = await stats(); return s.captured + s.pending === count + 1; });
+    await send({ action: 'setEnabled', sessionId: session, enabled: false });
+    await wait(async () => { const s = await stats(); return !s.pending && s.mediaCaptured === count; });
+    assert.equal((await stats()).session.error, '');
+    await control.evaluate(async id => { tabId = id; await refresh(); }, tabId);
+    assert.equal(await control.locator('#captured').textContent(), `${count} 件`);
+    assert.equal(await control.locator('#playlists').textContent(), '1 件');
+    const event = context.waitForEvent('page'); await send({ action: 'snapshot', sessionId: session }); const output = await event;
+    await wait(() => output.locator('#save').isEnabled());
+    await output.evaluate(() => { window.showSaveFilePicker = async () => (await navigator.storage.getDirectory()).getFileHandle('burst-output', { create: true }); });
+    await output.locator('#save').click();
+    await output.waitForFunction(() => document.getElementById('status').textContent.startsWith('書き出しが完了'), { timeout: 60000 });
+    assert.equal(await output.evaluate(async () => (await (await (await navigator.storage.getDirectory()).getFileHandle('burst-output')).getFile()).size), bytes);
+    await output.close();
+    console.log(`PASS ${type}: ${(bytes / 1024 / 1024).toFixed(1)} MiB concentrated fetch/XHR input, OFF drain, exact-size export and separate UI counts`);
+    await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id;
+    await send({ action: 'setEnabled', sessionId: session, enabled: true });
+  }
+  await worker.evaluate(() => {
+    globalThis.originalAppend = CaptureDB.append;
+    CaptureDB.append = async () => { throw new Error('Test storage failure'); };
+  });
+  await playback.evaluate(async () => { await (await fetch('/ts/seg0.ts?storageFailure=1')).arrayBuffer(); });
+  await wait(async () => (await stats()).session.error);
+  await worker.evaluate(() => { CaptureDB.append = globalThis.originalAppend; delete globalThis.originalAppend; });
+  await control.evaluate(async id => { tabId = id; await refresh(); }, tabId);
+  await wait(async () => (await control.locator('#status').textContent()).includes('自動再開しません'));
+  assert.equal(await control.locator('#toggleBtn').isEnabled(), false);
+  assert.equal(await control.locator('#downloadBtn').isEnabled(), false);
+  assert.equal(await control.locator('#failed').textContent(), '1 件');
+  await control.screenshot({ path: path.join(tmp, 'capture-stopped.png'), fullPage: true });
+  console.log('PASS actual storage failure: terminal stop is explicit, restart and export blocked until Clear');
+  await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id;
+  await send({ action: 'setEnabled', sessionId: session, enabled: true });
   await playback.evaluate(() => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(); xhr.open('HEAD', '/head/index.m3u8');
     xhr.onload = resolve; xhr.onerror = reject; xhr.send();
@@ -277,7 +332,7 @@ const errors = [];
   assert.equal((await control.evaluate(async () => (await CaptureDB.all('chunks')).length)), 0);
   console.log('PASS tab close: invalidates export and releases binary chunks');
   for (const [url, count] of requests) if (/\.(m3u8|ts|m4s|mp4)$/.test(url)) {
-    assert.equal(count, ['/ts/seg0.ts', '/startup/index.m3u8', '/startup/startup.ts'].includes(url) ? 2 : 1, `Unexpected refetch: ${url} (${count})`);
+    assert.equal(count, url === '/ts/seg0.ts' ? 3 : ['/startup/index.m3u8', '/startup/startup.ts'].includes(url) ? 2 : 1, `Unexpected refetch: ${url} (${count})`);
   }
   assert.deepEqual(errors, []);
   console.log('PASS network: no extension refetches; no uncaught page errors');
