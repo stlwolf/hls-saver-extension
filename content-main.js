@@ -57,7 +57,7 @@
     // Drain the clone promptly. Waiting on each DB ACK here would let the tee buffer grow.
     // Jobs are capped globally; on overload we cancel our branch instead of slowing playback.
     let writes = rpc({ action: 'begin', sessionId: start.sessionId, generation: start.generation,
-      url: meta.url, range: meta.range, mime: meta.mime }).then(result => {
+      url: meta.url, responseUrl: meta.responseUrl, range: meta.range, mime: meta.mime }).then(result => {
       recordId = result.recordId;
       if (result.skipped) { failed = new Error('収録の切り替えにより受付を終了しました。'); void reader.cancel().catch(() => {}); }
     }).catch(error => { failed = error; void reader.cancel().catch(() => {}); });
@@ -97,10 +97,12 @@
     const start = { ...state };
     const response = await originalFetch.apply(this, args);
     const input = args[0];
-    const url = response.url || (typeof input === 'string' ? new URL(input, location.href).href : input?.url || String(input));
-    if (isCurrent(start) && TARGET.test(url) && response.ok && response.body) {
+    const url = new URL(input?.url || String(input), location.href).href;
+    const responseUrl = response.url || url;
+    const method = String(args[1]?.method || input?.method || 'GET').toUpperCase();
+    if (method !== 'HEAD' && isCurrent(start) && (TARGET.test(url) || TARGET.test(responseUrl)) && response.ok && response.body) {
       try {
-        void capture(response.clone().body, { url, range: response.headers.get('content-range') || '',
+        void capture(response.clone().body, { url, responseUrl, range: response.headers.get('content-range') || '',
           mime: response.headers.get('content-type') || '', length: Number(response.headers.get('content-length')) }, start);
       } catch (error) { report(error, start); }
     }
@@ -113,24 +115,25 @@
     const previous = xhrInfo.get(this);
     if (previous?.onLoad) this.removeEventListener('load', previous.onLoad);
     const result = originalOpen.apply(this, [method, url, ...rest]);
-    xhrInfo.set(this, { url: new URL(String(url), location.href).href });
+    xhrInfo.set(this, { url: new URL(String(url), location.href).href, method: String(method).toUpperCase() });
     return result;
   };
   XMLHttpRequest.prototype.send = function(...args) {
     const info = xhrInfo.get(this);
     const start = { ...state };
-    if (info && start.enabled) {
+    if (info && info.method !== 'HEAD' && start.enabled) {
       info.onLoad = () => {
-        const url = this.responseURL || info.url;
-        if (!isCurrent(start) || !TARGET.test(url) || this.status < 200 || this.status >= 300) return;
+        const url = info.url;
+        const responseUrl = this.responseURL || url;
+        if (!isCurrent(start) || !(TARGET.test(url) || TARGET.test(responseUrl)) || this.status < 200 || this.status >= 300) return;
         try {
           let blob;
           if (this.response instanceof ArrayBuffer || this.response instanceof Blob) blob = new Blob([this.response]);
           else if (!this.responseType || this.responseType === 'text') {
-            if (!/\.m3u8(?:[?#]|$)/i.test(url)) throw new Error('テキスト形式の動画断片は保存できません。');
+            if (!/\.m3u8(?:[?#]|$)/i.test(url) && !/\.m3u8(?:[?#]|$)/i.test(responseUrl)) throw new Error('テキスト形式の動画断片は保存できません。');
             blob = new Blob([this.responseText]);
           } else throw new Error('未対応のXHRレスポンス形式です。');
-          void capture(blob.stream(), { url, range: this.getResponseHeader('content-range') || '',
+          void capture(blob.stream(), { url, responseUrl, range: this.getResponseHeader('content-range') || '',
             mime: this.getResponseHeader('content-type') || '', length: blob.size }, start);
         } catch (error) { report(error, start); }
       };

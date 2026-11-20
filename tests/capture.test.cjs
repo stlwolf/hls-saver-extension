@@ -80,3 +80,23 @@ test('reusing an aborted XHR does not leave an old capture listener; Blob respon
   assert.equal(s.messages.filter(m => m.action === 'begin').length, 1);
   assert.equal(s.messages.find(m => m.action === 'begin').url, 'https://video.test/actual.ts');
 });
+test('redirected fetch retains requested URL and final response URL separately', async () => {
+  const s = setup({ response: () => { const r = new Response(new Uint8Array([71, 1])); Object.defineProperty(r, 'url', { value: 'https://cdn.test/final.ts' }); return r; } });
+  s.set(true, 1); await s.w.fetch('https://video.test/original.ts'); await s.waitFor('finish');
+  const begin = s.messages.find(m => m.action === 'begin');
+  assert.equal(begin.url, 'https://video.test/original.ts'); assert.equal(begin.responseUrl, 'https://cdn.test/final.ts');
+});
+test('HEAD XHR does not create an empty recording or disable capture', async () => {
+  const s = setup(); s.set(true, 1);
+  const xhr = new s.XHR(); xhr.open('HEAD', '/index.m3u8'); xhr.responseType = ''; xhr.responseText = ''; xhr.status = 200;
+  xhr.send(); xhr.dispatchEvent(new Event('load'));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(s.messages.filter(m => m.type === 'HLS_SAVER_REQUEST').length, 0);
+});
+test('redirected XHR preserves its original segment address', async () => {
+  const s = setup(); s.set(true, 1);
+  const xhr = new s.XHR(); xhr.open('GET', '/original.ts'); xhr.responseType = 'blob'; xhr.response = new Blob([new Uint8Array([71, 4])]); xhr.responseURL = 'https://cdn.test/final.ts'; xhr.status = 200;
+  xhr.send(); xhr.dispatchEvent(new Event('load')); await s.waitFor('finish');
+  const begin = s.messages.find(m => m.action === 'begin');
+  assert.equal(begin.url, 'https://video.test/original.ts'); assert.equal(begin.responseUrl, 'https://cdn.test/final.ts');
+});

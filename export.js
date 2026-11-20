@@ -50,8 +50,10 @@ async function load() {
   }
   records.sort((a, b) => a.sequence - b.sequence);
   versions = [];
-  for (const record of records) if (/\.m3u8(?:[?#]|$)/i.test(record.url)) versions.push({ url: record.url, text: await textOf(record) });
-  const urls = [...new Set(versions.filter(v => !HLSPlaylist.parse(v.text, v.url).master).map(v => v.url))];
+  for (const record of records) {
+    if (/\.m3u8(?:[?#]|$)/i.test(record.url) || /\.m3u8(?:[?#]|$)/i.test(record.responseUrl)) versions.push({ url: record.url, base: record.responseUrl || record.url, text: await textOf(record) });
+  }
+  const urls = [...new Set(versions.filter(v => !HLSPlaylist.parse(v.text, v.base).master).map(v => v.url))];
   if (!urls.length) throw new Error('断片の順序を決めるプレイリストがありません。ONにした状態でリロードして再生してください。');
   for (const url of urls) { const option = document.createElement('option'); option.value = url; option.textContent = url; $('playlist').append(option); }
   $('playlist').disabled = false;
@@ -78,16 +80,12 @@ $('save').addEventListener('click', async () => {
     $('progress').max = plan.bytes;
     for (let partIndex = 0; partIndex < plan.parts.length; partIndex++) {
       const record = plan.parts[partIndex];
+      await CaptureMedia.validate(record, plan.container);
       let actual = 0;
       for (let index = 0; index < record.chunks; index++) {
         await checkSession();
         const chunk = await CaptureDB.get('chunks', [record.id, index]);
         if (!chunk) throw new Error('書き出し中にデータが削除されました。');
-        if (index === 0) {
-          const bytes = chunk.data;
-          if (plan.container === 'ts' && (bytes[0] !== 0x47 || (bytes.length > 188 && bytes[188] !== 0x47))) throw new Error('TSとして認識できない断片があります。');
-          if (plan.container === 'fmp4' && !['ftyp', 'moov', 'styp', 'moof', 'sidx', 'emsg', 'prft'].includes(String.fromCharCode(...bytes.subarray(4, 8)))) throw new Error('fMP4として認識できない断片があります。');
-        }
         await writer.write(chunk.data);
         actual += chunk.data.byteLength; done += chunk.data.byteLength;
         $('progress').value = done;

@@ -9,6 +9,7 @@ This is a vanilla-JavaScript Chrome MV3 extension. Read README.md for user behav
 - `background.js`: serialized lifecycle/capture/control lane, browser epoch, document validation, session cleanup and immutable export snapshots.
 - `storage.js`: extension-origin IndexedDB sessions, record metadata, binary chunks and exports. Mutations acknowledge transaction commit. Shared by worker and export page.
 - `playlist.js`: conservative HLS merge planning without network access.
+- `media.js`: bounded TS/fMP4 header validation across arbitrary stored chunk boundaries.
 - `export.html` / `export.js`: stable snapshot, explicit playlist choice, sequential File System Access writes, cancellation and source-session invalidation.
 - `popup.html` / `popup.js`: active-tab capture controls and metadata-only stats.
 - `ui.css`: shared UI styles.

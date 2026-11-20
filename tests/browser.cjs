@@ -26,14 +26,22 @@ const errors = [];
     const url = new URL(req.url, 'http://localhost');
     requests.set(url.pathname, (requests.get(url.pathname) || 0) + 1);
     if (url.pathname === '/') { res.setHeader('content-type', 'text/html'); res.end('<!doctype html><title>Playback fixture</title><video controls></video>'); return; }
+    if (url.pathname === '/head/index.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(); return; }
+    if (/^\/(ts|fmp4)\/index\.m3u8$/.test(url.pathname)) { res.writeHead(302, { location: '/media' + url.pathname }); res.end(); return; }
+    if (/^\/media\/(ts|fmp4)\/(?!index\.m3u8$)/.test(url.pathname)) { res.writeHead(302, { location: url.pathname.replace('/media/', '/delivery/') }); res.end(); return; }
     if (url.pathname === '/bulk/index.m3u8') {
       res.end('#EXTM3U\n' + Array.from({ length: bulkCount }, (_, i) => `#EXTINF:1,\n${i}.ts\n`).join('') + '#EXT-X-ENDLIST'); return;
     }
     if (/^\/bulk\/\d+\.ts$/.test(url.pathname)) { res.setHeader('content-length', bulkSegment.length); res.end(bulkSegment); return; }
-    const file = path.join(tmp, url.pathname);
+    const mapped = /^\/(?:media|delivery)\/(ts|fmp4)\/([^/]+)$/.exec(url.pathname);
+    const file = path.join(tmp, mapped ? `${mapped[1]}/${mapped[2]}` : url.pathname);
     if (!file.startsWith(tmp + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404); res.end(); return; }
     res.setHeader('content-type', file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'application/octet-stream');
     res.setHeader('content-length', fs.statSync(file).size);
+    if (file.endsWith('init.mp4')) {
+      const bytes = fs.readFileSync(file); res.write(bytes.subarray(0, 4));
+      setTimeout(() => res.end(bytes.subarray(4)), 80); return;
+    }
     fs.createReadStream(file).pipe(res);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -63,18 +71,33 @@ const errors = [];
   };
   const stats = () => send({ action: 'getStats', tabId });
   let session = (await wait(async () => (await stats()).session)).id;
+  await playback.evaluate(() => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(); xhr.open('HEAD', '/head/index.m3u8');
+    xhr.onload = resolve; xhr.onerror = reject; xhr.send();
+  }));
+  assert.equal((await stats()).captured, 0); assert.equal((await stats()).session.error, '');
+  console.log('PASS HEAD XHR: no empty capture or session failure');
   const fetchFiles = async type => playback.evaluate(async type => {
-    const base = `/${type}/`;
-    const text = await (await fetch(base + 'index.m3u8')).text();
+    const response = await fetch(`/${type}/index.m3u8`);
+    const base = response.url;
+    const text = await response.text();
     const init = /URI="([^"]+)"/.exec(text)?.[1];
-    if (init) await (await fetch(base + init)).arrayBuffer();
-    for (const line of text.split(/\r?\n/)) if (line && !line.startsWith('#')) await (await fetch(base + line)).arrayBuffer();
+    if (init) await (await fetch(new URL(init, base))).arrayBuffer();
+    for (const line of text.split(/\r?\n/)) if (line && !line.startsWith('#')) await (await fetch(new URL(line, base))).arrayBuffer();
   }, type);
   for (const type of ['ts', 'fmp4']) {
     if (type === 'fmp4') { await send({ action: 'clear', sessionId: session }); session = (await stats()).session.id; }
     await fetchFiles(type);
     const captured = await wait(async () => { const s = await stats(); return !s.pending && s.captured >= (type === 'ts' ? 4 : 5) && s; });
     assert.equal(captured.failed, 0); assert.equal(captured.session.error, '');
+    if (type === 'fmp4') {
+      const headerBytes = await control.evaluate(async sessionId => {
+        await import(chrome.runtime.getURL('storage.js'));
+        const init = (await CaptureDB.all('records', sessionId)).find(r => r.url.endsWith('init.mp4'));
+        return (await CaptureDB.get('chunks', [init.id, 0])).data.length;
+      }, session);
+      assert.equal(headerBytes, 4, 'Fixture must split the MP4 box header across stored chunks');
+    }
     const pageEvent = context.waitForEvent('page');
     await send({ action: 'snapshot', sessionId: session });
     const output = await pageEvent;
@@ -100,7 +123,7 @@ const errors = [];
     fs.writeFileSync(target, Buffer.from(bytes));
     const duration = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', target], { encoding: 'utf8' }).trim());
     assert.ok(duration >= 2.9 && duration <= 3.2, `Unexpected ${type} duration: ${duration}`);
-    console.log(`PASS ${type}: real extension capture -> real IDB -> sequential native file writer -> ffprobe ${duration}s; picker user activation verified`);
+    console.log(`PASS ${type}: redirected playlist and segments -> real IDB -> sequential native file writer -> ffprobe ${duration}s; picker user activation verified`);
     await output.screenshot({ path: path.join(tmp, `export-${type}.png`), fullPage: true });
     await output.evaluate(() => { window.showSaveFilePicker = async () => { throw new DOMException('Cancelled', 'AbortError'); }; });
     await output.locator('#save').click();
@@ -178,12 +201,19 @@ const errors = [];
   await wait(async () => (await stats()).session?.id !== session);
   await playback.evaluate(async () => { await (await fetch('/ts/seg0.ts?afterHistory=1')).arrayBuffer(); });
   await wait(async () => (await stats()).captured > 0 && !(await stats()).pending);
+  const beforeHash = (await stats()).session.id;
+  await playback.evaluate(() => { location.hash = '/watch/2'; });
+  await wait(async () => (await stats()).session?.id !== beforeHash);
+  assert.equal((await control.evaluate(async () => (await CaptureDB.all('chunks')).length)), 0);
+  console.log('PASS hash-route navigation: previous recording released');
+  await playback.evaluate(async () => { await (await fetch('/ts/seg1.ts?afterHash=1')).arrayBuffer(); });
+  await wait(async () => (await stats()).captured > 0 && !(await stats()).pending);
   await playback.close();
   await wait(async () => !(await stats()).session);
   assert.equal((await control.evaluate(async () => (await CaptureDB.all('chunks')).length)), 0);
   console.log('PASS tab close: invalidates export and releases binary chunks');
   for (const [url, count] of requests) if (/\.(m3u8|ts|m4s|mp4)$/.test(url)) {
-    assert.equal(count, url === '/ts/seg0.ts' ? 3 : 1, `Unexpected refetch: ${url} (${count})`);
+    assert.equal(count, url === '/ts/seg0.ts' ? 2 : 1, `Unexpected refetch: ${url} (${count})`);
   }
   assert.deepEqual(errors, []);
   console.log('PASS network: no extension refetches; no uncaught page errors');

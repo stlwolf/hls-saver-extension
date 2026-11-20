@@ -7,7 +7,7 @@ const { IDBFactory, IDBKeyRange } = require('fake-indexeddb');
 function load(context, name) { vm.runInContext(fs.readFileSync(`${__dirname}/../${name}`, 'utf8'), context, { filename: name }); }
 function context() {
   const c = vm.createContext({ indexedDB: new IDBFactory(), IDBKeyRange, console, crypto: webcrypto, Uint8Array, URL, atob, btoa, setTimeout, clearTimeout });
-  load(c, 'storage.js'); load(c, 'playlist.js'); return c;
+  load(c, 'storage.js'); load(c, 'playlist.js'); load(c, 'media.js'); return c;
 }
 const list = (segments, extras = '') => `#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n${extras}${segments.map(s => `#EXTINF:1,\n${s}\n`).join('')}#EXT-X-ENDLIST`;
 const rec = (url, sequence = 1, extra = {}) => ({ id: String(sequence), url: `https://video.test/${url}`, sequence, state: 'complete', size: 188, ...extra });
@@ -70,7 +70,7 @@ function background(c = context(), sessionStorage = {}, frames = new Map([[1, 'd
   c.chrome = {
     storage: { session: { get: async () => sessionStorage, set: async v => Object.assign(sessionStorage, v) }, local: { get: async () => ({}), set: async () => {} } },
     runtime: { getURL: path => `chrome-extension://test/${path}`, onMessage: event('message'), onStartup: event('startup') },
-    webNavigation: { getFrame: async ({ tabId }) => ({ documentId: frames.get(tabId) }), onCommitted: event('navigate'), onHistoryStateUpdated: event('history') },
+    webNavigation: { getFrame: async ({ tabId }) => ({ documentId: frames.get(tabId) }), onCommitted: event('navigate'), onHistoryStateUpdated: event('history'), onReferenceFragmentUpdated: event('fragment') },
     tabs: { sendMessage: async () => {}, create: async () => {}, onRemoved: event('removed') },
     alarms: { create: async () => {}, onAlarm: event('alarm') }
   };
@@ -139,4 +139,48 @@ test('SPA page changes invalidate the old recording and preserve the chosen capt
 test('ambiguous repeated URLs are rejected rather than mapped to the newest body twice', () => {
   const h = context().HLSPlaylist;
   assert.throws(() => h.plan([{ url: 'https://video.test/i.m3u8', text: list(['a.ts', 'a.ts']) }], [rec('a.ts')]), /複数の再生位置/);
+});
+test('rolling windows cannot erase a discontinuity-sequence boundary', () => {
+  const h = context().HLSPlaylist;
+  const versions = [
+    { url: 'https://video.test/i.m3u8', text: '#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:0\na.ts' },
+    { url: 'https://video.test/i.m3u8', text: '#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:11\n#EXT-X-DISCONTINUITY-SEQUENCE:1\nb.ts' }
+  ];
+  assert.throws(() => h.plan(versions, [rec('a.ts'), rec('b.ts', 2)]), /不連続/);
+});
+test('delta playlists with EXT-X-SKIP are rejected instead of shifting sequence numbers', () => {
+  const h = context().HLSPlaylist;
+  const versions = [
+    { url: 'https://video.test/i.m3u8', text: '#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\na.ts' },
+    { url: 'https://video.test/i.m3u8', text: '#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:101\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\nc.ts' }
+  ];
+  assert.throws(() => h.plan(versions, [rec('a.ts'), rec('c.ts', 2)]), /EXT-X-SKIP/);
+});
+test('hash-route changes invalidate stored data and export snapshots', async () => {
+  const b = background(); const s = await b.send({ action: 'register' }, b.page());
+  b.events.fragment({ frameId: 0, tabId: 1, documentId: 'doc1', url: 'https://video.test/#/watch/2' });
+  const stats = await b.send({ action: 'getStats', tabId: 1 }, b.control);
+  assert.notEqual(stats.session.id, s.id);
+  assert.equal(await b.c.CaptureDB.get('sessions', s.id), undefined);
+});
+test('redirected playlist uses its final URL as base and segments match requested URLs', () => {
+  const h = context().HLSPlaylist;
+  const plan = h.plan([{ url: 'https://video.test/entry.m3u8', base: 'https://video.test/cdn/index.m3u8', text: '#EXTM3U\na.ts' }], [rec('cdn/a.ts', 1, { responseUrl: 'https://other.test/signed.ts' })]);
+  assert.equal(plan.parts[0].url, 'https://video.test/cdn/a.ts');
+});
+test('fMP4 header is validated across short chunks with a bounded prefix read', async () => {
+  const media = context().CaptureMedia;
+  const parts = [new Uint8Array([0, 0, 0, 16]), new Uint8Array([102]), new Uint8Array([116, 121, 112]), new Uint8Array(1024)];
+  const reads = [];
+  const read = async (_, index) => { reads.push(index); return { data: parts[index] }; };
+  await media.validate({ id: 'init', chunks: 4, size: 1040 }, 'fmp4', read);
+  assert.deepEqual(reads, [0, 1, 2]);
+  await assert.rejects(() => media.validate({ id: 'bad', chunks: 1, size: 4 }, 'fmp4', read), /ヘッダー/);
+});
+test('TS sync bytes are checked even when network chunks split a packet boundary', async () => {
+  const media = context().CaptureMedia;
+  const bytes = new Uint8Array(376); bytes[0] = bytes[188] = 71;
+  await media.validate({ id: 'ts', chunks: 2, size: 376 }, 'ts', async (_, index) => ({ data: index ? bytes.subarray(4) : bytes.subarray(0, 4) }));
+  bytes[188] = 0;
+  await assert.rejects(() => media.validate({ id: 'ts', chunks: 2, size: 376 }, 'ts', async (_, index) => ({ data: index ? bytes.subarray(4) : bytes.subarray(0, 4) })), /TSとして/);
 });

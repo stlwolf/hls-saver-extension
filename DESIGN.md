@@ -43,3 +43,9 @@ The reviewer specifically identified clone tee buffering, stale document resurre
 - Real-browser tests also passed OFF behavior, picker cancellation, writer failure, reload cleanup, SPA cleanup and tab-close cleanup, with no uncaught page errors.
 - Save-file selection was replaced in automation with an OPFS file handle; writes used the actual native FileSystemWritableFileStream. User activation at the picker invocation was verified. The OS save dialog and the user's target website have not been manually tested.
 - Review found and corrected missing state-application acknowledgement, an overly low active-capture limit for short fMP4 segments, reused-XHR listeners, quadratic merge lookups, hidden control errors, and absent startup/SPA lifecycle listeners. No remaining critical findings were identified in the final local diff review.
+
+## Copilot review follow-up
+
+The first Copilot review identified six additional defects. The correction tracks discontinuity sequence numbers across rolling windows, explicitly rejects EXT-X-SKIP delta playlists, rotates sessions on hash navigation, preserves both requested and final URLs, excludes HEAD XHR, and validates media headers across chunk boundaries. Requested URLs identify captured segments; final playlist URLs resolve relative references. Format validation reads at most 189 prefix bytes instead of assuming the first network chunk contains a complete header.
+
+Regression tests cover each finding, including redirected fetch and XHR separately. Browser fixtures redirect playlists and segments, split an fMP4 init header after four bytes, and exercise HEAD and hash navigation. Review corrections are tested before requesting the next review.

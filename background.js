@@ -72,11 +72,13 @@ async function handle(message, sender) {
     if (session.tabId !== sender.tab.id || session.documentId !== sender.documentId) throw new Error('収録ページが一致しません。');
     if (message.action === 'begin') {
       if (!session.enabled || message.generation !== session.generation) return { skipped: true };
-      if (!/^https?:\/\//.test(message.url) || !/\.(m3u8|ts|m4s|mp4)(?:[?#]|$)/i.test(message.url)) throw new Error('対象外のURLです。');
+      const responseUrl = message.responseUrl || message.url;
+      const target = /\.(m3u8|ts|m4s|mp4)(?:[?#]|$)/i;
+      if (!/^https?:\/\//.test(message.url) || !/^https?:\/\//.test(responseUrl) || !(target.test(message.url) || target.test(responseUrl))) throw new Error('対象外のURLです。');
       if ((await CaptureDB.all('records', session.id)).filter(r => r.state === 'pending').length >= 32) throw new Error('同時保存数の上限を超えました。');
       session.sequence++;
       const record = { id: crypto.randomUUID(), sessionId: session.id, sequence: session.sequence,
-        url: message.url, range: message.range || '', mime: message.mime || '', state: 'pending',
+        url: message.url, responseUrl, range: message.range || '', mime: message.mime || '', state: 'pending',
         chunks: 0, size: 0, touched: Date.now() };
       await CaptureDB.put('sessions', session);
       await CaptureDB.put('records', record);
@@ -98,7 +100,7 @@ async function handle(message, sender) {
         if (record.chunks !== message.chunks || !record.size) throw new Error('保存が不完全です。');
         record.state = 'complete';
         await CaptureDB.put('records', record);
-        if (!/\.m3u8(?:[?#]|$)/i.test(record.url)) {
+        if (!/\.m3u8(?:[?#]|$)/i.test(record.url) && !/\.m3u8(?:[?#]|$)/i.test(record.responseUrl)) {
           const pinned = new Set((await CaptureDB.all('exports', session.id)).flatMap(job => job.recordIds));
           for (const old of await CaptureDB.all('records', session.id)) {
             if (old.id !== record.id && old.state === 'complete' && old.url === record.url && old.range === record.range && !pinned.has(old.id)) await CaptureDB.removeRecord(old.id);
@@ -169,12 +171,12 @@ chrome.webNavigation.onCommitted.addListener(details => {
     for (const s of await CaptureDB.all('sessions')) if (s.tabId === details.tabId && s.documentId !== details.documentId) await CaptureDB.removeSession(s.id);
   });
 });
-chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
+function rotatePageSession(details) {
   if (details.frameId !== 0) return;
   serialize(async () => {
     await ready;
     for (const old of await CaptureDB.all('sessions')) {
-      if (old.tabId !== details.tabId || old.pageUrl === details.url) continue;
+      if (old.tabId !== details.tabId || old.documentId !== details.documentId || old.pageUrl === details.url) continue;
       await CaptureDB.removeSession(old.id);
       const next = { ...old, id: crypto.randomUUID(), generation: old.generation + 1,
         pageUrl: details.url, sequence: 0, error: '' };
@@ -182,7 +184,9 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
       await sendState(next);
     }
   });
-});
+}
+chrome.webNavigation.onHistoryStateUpdated.addListener(rotatePageSession);
+chrome.webNavigation.onReferenceFragmentUpdated.addListener(rotatePageSession);
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'capture-maintenance') serialize(async () => { await ready; await maintain(); });
 });
